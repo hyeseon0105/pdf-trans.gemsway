@@ -1,0 +1,42 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: pdf-translator-backend
+    env_file:
+      - ./.env
+    ports:
+      - "8000:8000"
+    environment:
+      - FRONTEND_ORIGIN=http://localhost:5173
+      - WINDOWS_MALGUN_TTF=/usr/share/fonts/truetype/nanum/NanumGothic.ttf
+      - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+    volumes:
+      - backend_storage:/app/app/storage
+    networks:
+      - pdf-net
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        - VITE_API_BASE=http://localhost:8000
+    container_name: pdf-translator-frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+    networks:
+      - pdf-net
+
+networks:
+  pdf-net:
+    driver: bridge
+
+volumes:
+  backend_storage:
+
+
