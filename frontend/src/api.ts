@@ -1,7 +1,7 @@
 const API_BASE = resolveApiBase()
 
 function resolveApiBase(): string {
-  const envBase = import.meta.env.VITE_API_BASE
+  const envBase = (import.meta as any).env?.VITE_API_BASE as string | undefined
   if (envBase && typeof envBase === 'string' && envBase.trim().length > 0) {
     return envBase.replace(/\/$/, '')
   }
@@ -18,19 +18,81 @@ function resolveApiBase(): string {
   return 'http://localhost:8000'
 }
 
-export async function uploadAndTranslatePdf(file: File): Promise<{ translatedText: string; fileId: string }> {
+export type LayoutBlock = {
+  bbox: [number, number, number, number]
+  text: string
+  translated_text?: string
+  font_size?: number
+}
+
+export type LayoutPage = {
+  width: number
+  height: number
+  blocks: LayoutBlock[]
+}
+
+export type TranslateResponse = {
+  uploadId: string
+  fileId: string
+  translatedText: string
+  layout?: { pages: LayoutPage[] }
+}
+
+export function getUploadPdfUrl(uploadId: string): string {
+  return `${API_BASE}/api/uploads/${uploadId}`
+}
+
+export async function uploadAndTranslatePdf(
+  file: File,
+  onProgress?: (percent: number) => void
+): Promise<TranslateResponse> {
+  return new Promise((resolve, reject) => {
   const formData = new FormData()
   formData.append('file', file)
-  const resp = await fetch(`${API_BASE}/api/translate/pdf`, {
-    method: 'POST',
-    body: formData
-  })
-  if (!resp.ok) {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API_BASE}/api/translate/pdf`)
+    xhr.responseType = 'json'
+
+    xhr.onload = async () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const data = xhr.response ?? {}
+        resolve({
+          translatedText: data.translated_text ?? '',
+          fileId: data.file_id ?? '',
+          uploadId: data.upload_id ?? '',
+          layout: data.layout ?? undefined
+        })
+      } else {
+        try {
+          const resp = new Response(xhr.response ?? xhr.responseText, { status: xhr.status })
     const msg = await safeError(resp)
-    throw new Error(msg)
-  }
-  const data = await resp.json()
-  return { translatedText: data.translated_text ?? '', fileId: data.file_id ?? '' }
+          reject(new Error(msg))
+        } catch {
+          reject(new Error(`요청 실패 (${xhr.status})`))
+        }
+      }
+    }
+
+    xhr.onerror = () => {
+      reject(new Error('네트워크 오류가 발생했습니다.'))
+    }
+
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const percent = Math.round((event.loaded / event.total) * 100)
+          onProgress(Math.min(99, percent))
+        } else {
+          onProgress(50)
+        }
+      }
+      xhr.upload.onload = () => {
+        onProgress(100)
+      }
+    }
+
+    xhr.send(formData)
+  })
 }
 
 export async function downloadTranslatedPdf(fileId: string): Promise<Blob> {
