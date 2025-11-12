@@ -3,8 +3,10 @@ import uuid
 from pathlib import Path
 from difflib import SequenceMatcher
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Body
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from typing import Optional
 
 from ..config import UPLOADS_DIR, TRANSLATED_DIR
 from ..services.pdf_utils import (
@@ -14,6 +16,7 @@ from ..services.pdf_utils import (
 	extract_layout_blocks_ocr,
 )
 from ..services.translate_service import translate_text
+from ..services.translation_review import review_translation
 
 router = APIRouter()
 
@@ -189,11 +192,21 @@ async def translate_pdf(file: UploadFile = File(...)):
 	except Exception as e:
 		raise HTTPException(status_code=500, detail=f"번역 PDF 생성 실패: {e}")
 
+	# 자동 번역 검수 수행
+	review_result = None
+	try:
+		review_result = review_translation(text, translated)
+	except Exception as e:
+		# 검수 실패해도 번역 결과는 반환
+		pass
+
 	return {
 		"upload_id": upload_id,
 		"file_id": file_id,
+		"original_text": text,  # 원문 텍스트 추가
 		"translated_text": translated,
 		"layout": layout,
+		"review": review_result,  # 검수 결과 추가
 	}
 
 
@@ -211,5 +224,52 @@ def get_uploaded_pdf(upload_id: str):
 	if not path.exists():
 		raise HTTPException(status_code=404, detail="업로드 파일을 찾을 수 없습니다.")
 	return FileResponse(path, filename="original.pdf", media_type="application/pdf")
+
+
+class ReviewRequest(BaseModel):
+	original_pdf_path: Optional[str] = None
+	translated_text: Optional[str] = None
+
+
+@router.post("/review/translation")
+async def review_translation_endpoint(request: ReviewRequest):
+	"""
+	번역 검수 및 보정 엔드포인트
+	
+	Request Body:
+		{
+			"original_pdf_path": "C:\\Users\\HP\\OneDrive\\바탕 화면\\젬스웨이\\Brochure-Summit-System-190272-937-REV10_251031.pdf",
+			"translated_text": "번역된 텍스트..." (선택사항)
+		}
+	
+	Returns:
+		JSON 형식의 검수 결과
+	"""
+	try:
+		# 원문 추출
+		if request.original_pdf_path:
+			original_path = Path(request.original_pdf_path)
+			if not original_path.exists():
+				raise HTTPException(status_code=404, detail=f"원문 PDF 파일을 찾을 수 없습니다: {request.original_pdf_path}")
+			original_text = extract_text_from_pdf(original_path)
+		else:
+			raise HTTPException(status_code=400, detail="original_pdf_path가 필요합니다.")
+		
+		if not original_text.strip():
+			raise HTTPException(status_code=400, detail="원문 PDF에서 텍스트를 추출할 수 없습니다.")
+		
+		# 번역문이 없으면 번역 수행
+		if not request.translated_text:
+			translated_text = translate_text(original_text, target_lang="ko")
+		else:
+			translated_text = request.translated_text
+		
+		# 검수 수행
+		review_result = review_translation(original_text, translated_text)
+		
+		return review_result
+		
+	except Exception as e:
+		raise HTTPException(status_code=500, detail=f"번역 검수 중 오류 발생: {str(e)}")
 
 

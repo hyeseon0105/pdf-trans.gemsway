@@ -6,6 +6,7 @@ import { TranslationResult } from './components/TranslationResult'
 import { DesignPreview, type DesignPreviewHandle } from './components/DesignPreview'
 
 function App() {
+  const [originalText, setOriginalText] = useState<string>('')
   const [translatedText, setTranslatedText] = useState<string>('')
   const [fileId, setFileId] = useState<string>('')
   const [uploadId, setUploadId] = useState<string>('')
@@ -20,6 +21,7 @@ function App() {
   const handleUpload = async (file: File) => {
     setError('')
     setLoading(true)
+    setOriginalText('')
     setTranslatedText('')
     setFileId('')
     setUploadId('')
@@ -34,6 +36,7 @@ function App() {
       const result = await uploadAndTranslatePdf(file, (percent: number) => {
         setUploadProgress(percent)
       })
+      setOriginalText(result.originalText)
       setTranslatedText(result.translatedText)
       setFileId(result.fileId)
       setUploadId(result.uploadId)
@@ -147,7 +150,12 @@ function App() {
               → 원본 디자인 미리보기
             </button>
           </div>
-      <TranslationResult text={translatedText} onDownload={handleServerPdfDownload} canDownload={!!translatedText} />
+      <TranslationResult 
+        originalText={originalText} 
+        translatedText={translatedText} 
+        onDownload={handleServerPdfDownload} 
+        canDownload={!!translatedText} 
+      />
         </>
       )}
       {previewMode && uploadId && (

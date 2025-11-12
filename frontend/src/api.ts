@@ -31,11 +31,34 @@ export type LayoutPage = {
   blocks: LayoutBlock[]
 }
 
+export type ReviewResult = {
+  english: string | null
+  korean: string | null
+  status: string
+  similarity: number
+  suggestion: string | null
+}
+
+export type ReviewSummary = {
+  total_paragraphs: number
+  ok_count: number
+  warning_count: number
+  missing_count: number
+  accuracy_percent: number
+}
+
+export type ReviewData = {
+  results: ReviewResult[]
+  summary: ReviewSummary
+}
+
 export type TranslateResponse = {
   uploadId: string
   fileId: string
+  originalText: string
   translatedText: string
   layout?: { pages: LayoutPage[] }
+  review?: ReviewData
 }
 
 export function getUploadPdfUrl(uploadId: string): string {
@@ -57,10 +80,12 @@ export async function uploadAndTranslatePdf(
       if (xhr.status >= 200 && xhr.status < 300) {
         const data = xhr.response ?? {}
         resolve({
+          originalText: data.original_text ?? '',
           translatedText: data.translated_text ?? '',
           fileId: data.file_id ?? '',
           uploadId: data.upload_id ?? '',
-          layout: data.layout ?? undefined
+          layout: data.layout ?? undefined,
+          review: data.review ?? undefined
         })
       } else {
         try {

@@ -1,11 +1,12 @@
 type Props = {
-  text: string
+  originalText: string
+  translatedText: string
   canDownload: boolean
   onDownload: () => void
 }
 
-export function TranslationResult({ text, canDownload, onDownload }: Props) {
-  if (!text) return null
+export function TranslationResult({ originalText, translatedText, canDownload, onDownload }: Props) {
+  if (!translatedText) return null
   return (
     <div className="result">
       <div className="result-header">
@@ -14,7 +15,55 @@ export function TranslationResult({ text, canDownload, onDownload }: Props) {
           PDF로 다운로드
         </button>
       </div>
-      <pre className="result-text">{text}</pre>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: '16px',
+        marginTop: '16px'
+      }}>
+        <div>
+          <h3 style={{ margin: '0 0 8px 0', fontSize: '16px', fontWeight: 600, color: '#ffffff' }}>
+            원문
+          </h3>
+          <pre className="result-text" style={{
+            margin: 0,
+            padding: '16px',
+            backgroundColor: '#1a1a1a',
+            color: '#ffffff',
+            borderRadius: '8px',
+            border: '1px solid #333333',
+            fontSize: '14px',
+            lineHeight: '1.6',
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            maxHeight: '600px',
+            overflowY: 'auto'
+          }}>
+            {originalText}
+          </pre>
+        </div>
+        <div>
+          <h3 style={{ margin: '0 0 8px 0', fontSize: '16px', fontWeight: 600, color: '#ffffff' }}>
+            번역문
+          </h3>
+          <pre className="result-text" style={{
+            margin: 0,
+            padding: '16px',
+            backgroundColor: '#1a1a1a',
+            color: '#ffffff',
+            borderRadius: '8px',
+            border: '1px solid #333333',
+            fontSize: '14px',
+            lineHeight: '1.6',
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            maxHeight: '600px',
+            overflowY: 'auto'
+          }}>
+            {translatedText}
+          </pre>
+        </div>
+      </div>
     </div>
   )
 }
