@@ -22,16 +22,16 @@ export function TranslationResult({ originalText, translatedText, canDownload, o
         marginTop: '16px'
       }}>
         <div>
-          <h3 style={{ margin: '0 0 8px 0', fontSize: '16px', fontWeight: 600, color: '#ffffff' }}>
+          <h3 style={{ margin: '0 0 8px 0', fontSize: '16px', fontWeight: 600, color: '#000000' }}>
             원문
           </h3>
           <pre className="result-text" style={{
             margin: 0,
             padding: '16px',
-            backgroundColor: '#1a1a1a',
-            color: '#ffffff',
+            backgroundColor: '#ffffff',
+            color: '#000000',
             borderRadius: '8px',
-            border: '1px solid #333333',
+            border: '1px solid #e0e0e0',
             fontSize: '14px',
             lineHeight: '1.6',
             whiteSpace: 'pre-wrap',
@@ -43,16 +43,16 @@ export function TranslationResult({ originalText, translatedText, canDownload, o
           </pre>
         </div>
         <div>
-          <h3 style={{ margin: '0 0 8px 0', fontSize: '16px', fontWeight: 600, color: '#ffffff' }}>
+          <h3 style={{ margin: '0 0 8px 0', fontSize: '16px', fontWeight: 600, color: '#000000' }}>
             번역문
           </h3>
           <pre className="result-text" style={{
             margin: 0,
             padding: '16px',
-            backgroundColor: '#1a1a1a',
-            color: '#ffffff',
+            backgroundColor: '#ffffff',
+            color: '#000000',
             borderRadius: '8px',
-            border: '1px solid #333333',
+            border: '1px solid #e0e0e0',
             fontSize: '14px',
             lineHeight: '1.6',
             whiteSpace: 'pre-wrap',

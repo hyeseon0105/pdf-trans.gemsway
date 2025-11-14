@@ -23,6 +23,7 @@ export type LayoutBlock = {
   text: string
   translated_text?: string
   font_size?: number
+  text_start_x?: number  // Original text start position for alignment
 }
 
 export type LayoutPage = {
@@ -58,11 +59,20 @@ export type TranslateResponse = {
   originalText: string
   translatedText: string
   layout?: { pages: LayoutPage[] }
+  preview?: { id: string, count: number }
   review?: ReviewData
 }
 
 export function getUploadPdfUrl(uploadId: string): string {
   return `${API_BASE}/api/uploads/${uploadId}`
+}
+
+export function getPreviewImageUrl(previewId: string, pageIndex1Based: number): string {
+  return `${API_BASE}/api/preview/${previewId}/${pageIndex1Based}`
+}
+
+export function getTextOverlayUrl(previewId: string, pageIndex1Based: number, textIndex: number): string {
+  return `${API_BASE}/api/preview/${previewId}/${pageIndex1Based}/text/${textIndex}`
 }
 
 export async function uploadAndTranslatePdf(
@@ -75,6 +85,8 @@ export async function uploadAndTranslatePdf(
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${API_BASE}/api/translate/pdf`)
     xhr.responseType = 'json'
+    // 큰 파일 처리를 위해 타임아웃을 30분(1800000ms)으로 설정
+    xhr.timeout = 30 * 60 * 1000
 
     xhr.onload = async () => {
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -85,6 +97,7 @@ export async function uploadAndTranslatePdf(
           fileId: data.file_id ?? '',
           uploadId: data.upload_id ?? '',
           layout: data.layout ?? undefined,
+          preview: data.preview ?? undefined,
           review: data.review ?? undefined
         })
       } else {
@@ -100,6 +113,10 @@ export async function uploadAndTranslatePdf(
 
     xhr.onerror = () => {
       reject(new Error('네트워크 오류가 발생했습니다.'))
+    }
+
+    xhr.ontimeout = () => {
+      reject(new Error('요청 시간이 초과되었습니다. 파일이 너무 크거나 서버 처리 시간이 오래 걸립니다.'))
     }
 
     if (xhr.upload && onProgress) {
@@ -121,12 +138,34 @@ export async function uploadAndTranslatePdf(
 }
 
 export async function downloadTranslatedPdf(fileId: string): Promise<Blob> {
-  const resp = await fetch(`${API_BASE}/api/download/${fileId}`)
-  if (!resp.ok) {
-    const msg = await safeError(resp)
-    throw new Error(msg)
+  try {
+    console.log(`[PDF 다운로드] 시작: fileId=${fileId}`)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000) // 10분 타임아웃
+    
+    const resp = await fetch(`${API_BASE}/api/download/${fileId}`, {
+      signal: controller.signal,
+    })
+    clearTimeout(timeoutId)
+    
+    if (!resp.ok) {
+      const msg = await safeError(resp)
+      console.error(`[PDF 다운로드] 실패: ${resp.status} - ${msg}`)
+      throw new Error(msg)
+    }
+    
+    console.log(`[PDF 다운로드] 응답 받음, 크기: ${resp.headers.get('content-length') || '알 수 없음'} bytes`)
+    const blob = await resp.blob()
+    console.log(`[PDF 다운로드] 완료: ${blob.size} bytes`)
+    return blob
+  } catch (error: any) {
+    if (error.name === 'AbortError') {
+      console.error('[PDF 다운로드] 타임아웃 발생')
+      throw new Error('다운로드 시간이 초과되었습니다. 파일이 너무 큽니다.')
+    }
+    console.error(`[PDF 다운로드] 오류:`, error)
+    throw error
   }
-  return await resp.blob()
 }
 
 async function safeError(resp: Response): Promise<string> {

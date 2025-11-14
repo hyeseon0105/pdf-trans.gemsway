@@ -7,8 +7,9 @@ ROOT_DIR = BASE_DIR.parent
 STORAGE_DIR = ROOT_DIR / "app" / "storage"
 UPLOADS_DIR = STORAGE_DIR / "uploads"
 TRANSLATED_DIR = STORAGE_DIR / "translated"
+PREVIEWS_DIR = STORAGE_DIR / "previews"
 
-for directory in (STORAGE_DIR, UPLOADS_DIR, TRANSLATED_DIR):
+for directory in (STORAGE_DIR, UPLOADS_DIR, TRANSLATED_DIR, PREVIEWS_DIR):
     directory.mkdir(exist_ok=True, parents=True)
 
 ALLOWED_ORIGINS: List[str] = [

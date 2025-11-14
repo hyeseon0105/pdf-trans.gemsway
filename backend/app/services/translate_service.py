@@ -95,20 +95,25 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 	outputs: List[str] = []
 	for chunk in chunks:
 		prompt = (
-			f"Translate the following English text into natural {target_lang} (Korean).\n"
+			f"Translate the following English text into natural, fluent {target_lang} (Korean).\n"
+			f"- Use natural Korean expressions and sentence flow.\n"
+			f"- Maintain smooth transitions between sentences.\n"
+			f"- Complete all sentences fully - do not cut off mid-sentence.\n"
 			f"- Preserve paragraph and newline structure exactly.\n"
 			f"- Do not add notes, headers, or explanations.\n"
-			f"- Return only the translated text.\n\n"
+			f"- Return only the translated text.\n"
+			f"- Ensure the translation reads naturally as if written originally in Korean.\n"
+			f"- Make sure every sentence is complete and grammatically correct.\n\n"
 			f"Text:\n{chunk}"
 		)
 		try:
 			resp = client.chat.completions.create(
 				model=model,
 				messages=[
-					{"role": "system", "content": "You are a professional translator."},
+					{"role": "system", "content": "You are a professional Korean translator specializing in natural, fluent translations. Your translations read as if they were originally written in Korean, with smooth sentence flow and natural expressions. Always complete every sentence fully - never cut off mid-sentence. Ensure all translations are grammatically correct and contextually appropriate."},
 					{"role": "user", "content": prompt},
 				],
-				temperature=0.2,
+				temperature=0.2,  # 더 일관된 번역을 위해 온도 낮춤
 			)
 			content = resp.choices[0].message.content if resp.choices else ""
 			outputs.append(content or "")

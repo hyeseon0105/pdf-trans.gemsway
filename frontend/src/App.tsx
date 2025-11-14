@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { uploadAndTranslatePdf, downloadTranslatedPdf, getUploadPdfUrl, type TranslateResponse } from './api'
+import { uploadAndTranslatePdf, downloadTranslatedPdf, getUploadPdfUrl, getPreviewImageUrl, type TranslateResponse } from './api'
 import { generatePdfFromText } from './pdf'
 import { PdfUploader } from './components/PdfUploader'
 import { TranslationResult } from './components/TranslationResult'
@@ -11,11 +11,13 @@ function App() {
   const [fileId, setFileId] = useState<string>('')
   const [uploadId, setUploadId] = useState<string>('')
   const [layout, setLayout] = useState<TranslateResponse['layout']>()
+  const [preview, setPreview] = useState<TranslateResponse['preview']>()
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string>('')
   const [originalFileName, setOriginalFileName] = useState<string>('')
   const [previewMode, setPreviewMode] = useState<boolean>(false)
   const [uploadProgress, setUploadProgress] = useState<number>(0)
+  const [downloading, setDownloading] = useState<boolean>(false)
   const previewRef = useRef<DesignPreviewHandle | null>(null)
 
   const handleUpload = async (file: File) => {
@@ -41,6 +43,7 @@ function App() {
       setFileId(result.fileId)
       setUploadId(result.uploadId)
       setLayout(result.layout)
+      setPreview(result.preview)
     } catch (e: any) {
       setError(e?.message ?? '업로드/번역 중 오류가 발생했습니다.')
     } finally {
@@ -52,21 +55,34 @@ function App() {
   const handleServerPdfDownload = async () => {
     const base = originalFileName?.replace(/\.[^/.]+$/, '') || 'document'
     const out = `translated_${base}.pdf`
+    setError('')
+    setDownloading(true)
     try {
+      console.log('[다운로드] 시작:', { fileId, translatedTextLength: translatedText.length })
       if (fileId) {
+        console.log('[다운로드] 서버 PDF 다운로드 시도')
         const blob = await downloadTranslatedPdf(fileId)
+        console.log('[다운로드] 서버 PDF 받음, 크기:', blob.size, 'bytes')
         const url = URL.createObjectURL(blob)
         const a = document.createElement('a')
         a.href = url
         a.download = out
+        document.body.appendChild(a)
         a.click()
+        document.body.removeChild(a)
         URL.revokeObjectURL(url)
+        console.log('[다운로드] 완료')
         return
       }
       // 안전망: 서버 fileId가 없다면 클라이언트에서 생성
+      console.log('[다운로드] 클라이언트 PDF 생성')
       generatePdfFromText(translatedText, out)
+      console.log('[다운로드] 클라이언트 PDF 생성 완료')
     } catch (e: any) {
+      console.error('[다운로드] 오류:', e)
       setError(e?.message ?? '다운로드 중 오류가 발생했습니다.')
+    } finally {
+      setDownloading(false)
     }
   }
 
@@ -81,7 +97,7 @@ function App() {
   }
 
   return (
-    <div className="container">
+    <div className="container" style={{ paddingLeft: '0', paddingRight: '0', marginLeft: '0', marginRight: '0', textAlign: 'left' }}>
       {loading && (
         <div
           style={{
@@ -154,19 +170,30 @@ function App() {
         originalText={originalText} 
         translatedText={translatedText} 
         onDownload={handleServerPdfDownload} 
-        canDownload={!!translatedText} 
+        canDownload={!!translatedText && !downloading} 
       />
+      {downloading && (
+        <div style={{ marginTop: 8, padding: 12, backgroundColor: '#f0f0f0', borderRadius: 4 }}>
+          PDF 다운로드 중... (큰 파일의 경우 시간이 걸릴 수 있습니다)
+        </div>
+      )}
         </>
       )}
       {previewMode && uploadId && (
-        <div style={{ marginTop: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <div style={{ marginTop: 12, marginLeft: '0', paddingLeft: '0' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, marginLeft: '0' }}>
             <button onClick={() => setPreviewMode(false)}>← 번역 텍스트 보기</button>
             <button onClick={handlePreviewDownload} disabled={!layout || !layout?.pages?.length}>
               PDF로 다운로드
             </button>
           </div>
-          <DesignPreview ref={previewRef} pdfUrl={getUploadPdfUrl(uploadId)} pages={layout?.pages} />
+          <DesignPreview
+            ref={previewRef}
+            pdfUrl={getUploadPdfUrl(uploadId)}
+            pages={layout?.pages}
+            bgImages={preview?.id && preview?.count ? Array.from({ length: preview.count }).map((_, i) => getPreviewImageUrl(preview.id, i + 1)) : undefined}
+            previewId={preview?.id}
+          />
         </div>
       )}
     </div>
