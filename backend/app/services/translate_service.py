@@ -95,28 +95,37 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 	outputs: List[str] = []
 	for chunk in chunks:
 		prompt = (
-			f"Translate the following English text into Korean ({target_lang}).\n"
-			f"CRITICAL REQUIREMENTS:\n"
-			f"1. Maintain EXACT paragraph order, line breaks, and item structure from the original\n"
-			f"2. Translate 100% accurately - no errors, additions, or omissions\n"
-			f"3. Use technical document tone (professional and concise style)\n"
-			f"4. Preserve section titles exactly as they appear in the original (e.g., 'Secure and manage your network', 'Power-up CadLink with these options')\n"
-			f"5. Do not add any content not in the original\n"
-			f"6. Translate all text including any broken characters or missing parts based on the original PDF\n"
-			f"7. Preserve paragraph and newline structure exactly\n"
-			f"8. Return only the translated text - no notes, headers, or explanations\n"
-			f"9. Ensure every sentence is complete and grammatically correct\n"
-			f"10. Use natural Korean expressions appropriate for technical documentation\n\n"
-			f"Text to translate:\n{chunk}"
+			f"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요.\n\n"
+			f"번역 원칙:\n"
+			f"1. 【직역 금지】 단어 하나하나를 직역하지 말고, 의미를 정확히 전달하는 자연스러운 한국어로 번역\n"
+			f"2. 【자연스러운 어순】 한국어 어순과 표현 방식에 맞게 문장 구조 재배치\n"
+			f"3. 【읽기 쉽게】 전문 용어도 한국 독자가 이해하기 쉽게 설명적으로 번역\n"
+			f"4. 【문맥 고려】 문맥을 파악하여 가장 적절한 한국어 표현 사용\n"
+			f"5. 【구조 유지】 문단 구분, 줄바꿈, 리스트 구조는 원본과 동일하게 유지\n"
+			f"6. 【완전성】 모든 내용을 빠짐없이 번역하되, 불필요한 내용 추가하지 않기\n"
+			f"7. 【자연스러운 종결】 제목은 체언형(명사형), 본문은 '~합니다/됩니다/있습니다' 등 문맥에 맞는 자연스러운 종결어미 사용\n"
+			f"8. 【기술 문서】 전문성을 유지하되 딱딱하지 않고 읽기 편한 설명투로 작성\n\n"
+			f"번역할 텍스트:\n{chunk}"
 		)
 		try:
 			resp = client.chat.completions.create(
 				model=model,
 				messages=[
-					{"role": "system", "content": "You are a professional Korean translator specializing in technical documentation. Your translations are 100% accurate with no additions or omissions. You maintain exact paragraph order, line breaks, and item structure from the original. You use a professional, concise technical document tone. You preserve section titles exactly as they appear. You never add content not in the original. Always complete every sentence fully - never cut off mid-sentence. Ensure all translations are grammatically correct and contextually appropriate."},
+					{
+						"role": "system", 
+						"content": (
+							"당신은 10년 경력의 전문 기술 번역가입니다. "
+							"영어를 자연스러운 한국어로 의역하는 것이 핵심입니다. "
+							"직역은 절대 금지되며, 한국 독자가 읽기 편한 자연스러운 표현을 사용합니다. "
+							"기술 용어는 필요시 부연 설명을 추가하여 이해하기 쉽게 만듭니다. "
+							"문장 구조는 한국어 어순에 맞게 재배치하고, 어색한 표현은 자연스럽게 다듬습니다. "
+							"전문성을 유지하되 딱딱하지 않은 설명투로 작성하여 독자가 편안하게 읽을 수 있도록 합니다. "
+							"모든 내용을 완전히 번역하되, 원본에 없는 내용은 추가하지 않습니다."
+						)
+					},
 					{"role": "user", "content": prompt},
 				],
-				temperature=0.1,  # Very low temperature for maximum accuracy and consistency
+				temperature=0.3,  # 자연스러운 표현을 위해 약간 높임
 			)
 			content = resp.choices[0].message.content if resp.choices else ""
 			outputs.append(content or "")

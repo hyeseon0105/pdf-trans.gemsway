@@ -105,19 +105,324 @@ def create_pdf_from_text(text: str, output_path: Path):
 
 
 
+def _compute_iou(bbox1: list, bbox2: list) -> float:
+	"""
+	Compute Intersection over Union (IoU) of two bounding boxes.
+	bbox: [x0, y0, x1, y1]
+	"""
+	x0_1, y0_1, x1_1, y1_1 = bbox1
+	x0_2, y0_2, x1_2, y1_2 = bbox2
+	
+	# Intersection
+	ix0 = max(x0_1, x0_2)
+	iy0 = max(y0_1, y0_2)
+	ix1 = min(x1_1, x1_2)
+	iy1 = min(y1_1, y1_2)
+	
+	if ix1 <= ix0 or iy1 <= iy0:
+		return 0.0
+	
+	intersection = (ix1 - ix0) * (iy1 - iy0)
+	area1 = (x1_1 - x0_1) * (y1_1 - y0_1)
+	area2 = (x1_2 - x0_2) * (y1_2 - y0_2)
+	union = area1 + area2 - intersection
+	
+	if union <= 0:
+		return 0.0
+	
+	return intersection / union
+
+
+def _text_similarity(text1: str, text2: str) -> float:
+	"""
+	Compute text similarity ratio (0.0 to 1.0).
+	"""
+	t1 = text1.strip().lower()
+	t2 = text2.strip().lower()
+	if not t1 or not t2:
+		return 0.0
+	
+	# Check exact match
+	if t1 == t2:
+		return 1.0
+	
+	# Check substring
+	if t1 in t2 or t2 in t1:
+		return max(len(t1), len(t2)) / max(len(t1), len(t2))
+	
+	# Character-level similarity
+	from difflib import SequenceMatcher
+	return SequenceMatcher(None, t1, t2).ratio()
+
+
+def _merge_spans_in_line(spans: list) -> tuple[str, float, float]:
+	"""
+	Merge spans within a line into text, handling soft hyphens correctly.
+	Returns (merged_text, line_x0, median_font_size)
+	"""
+	if not spans:
+		return "", 0.0, 0.0
+	
+	text_parts = []
+	sizes = []
+	x0_min = None
+	
+	for span in spans:
+		text = span.get("text", "") or ""
+		if not text:
+			continue
+		
+		# Remove soft hyphens (Unicode U+00AD)
+		text = text.replace("\u00ad", "")
+		
+		text_parts.append(text)
+		
+		size = span.get("size", 0.0) or 0.0
+		if size > 0:
+			sizes.append(float(size))
+		
+		bbox = span.get("bbox")
+		if bbox and len(bbox) == 4:
+			sx0 = float(bbox[0])
+			if x0_min is None or sx0 < x0_min:
+				x0_min = sx0
+	
+	merged_text = "".join(text_parts)
+	
+	# Handle hyphenation at end of line
+	# Remove trailing hyphen if it's a word break
+	if merged_text.endswith("-") and len(merged_text) > 1:
+		# Keep hyphen if it's part of a compound word (preceded by alphanumeric)
+		if merged_text[-2].isalnum():
+			merged_text = merged_text[:-1]  # Remove hyphen for word continuation
+	
+	median_size = 0.0
+	if sizes:
+		sizes_sorted = sorted(sizes)
+		mid = len(sizes_sorted) // 2
+		if len(sizes_sorted) % 2 == 0:
+			median_size = (sizes_sorted[mid - 1] + sizes_sorted[mid]) / 2.0
+		else:
+			median_size = sizes_sorted[mid]
+	
+	return merged_text, x0_min or 0.0, median_size
+
+
+def _detect_bullet_list(text: str) -> bool:
+	"""
+	Detect if text starts with a bullet/list marker.
+	"""
+	if not text:
+		return False
+	
+	stripped = text.lstrip()
+	if not stripped:
+		return False
+	
+	# Common bullet characters
+	bullet_chars = ['•', '◦', '▪', '▫', '–', '—', '●', '○', '■', '□', '‣', '⁃', '*', '·']
+	
+	if stripped[0] in bullet_chars:
+		return True
+	
+	# Numbered lists: 1. 2. 3. etc.
+	import re
+	if re.match(r'^\d{1,3}[\.\)]\s', stripped):
+		return True
+	
+	# Lettered lists: a. b. c. A. B. C.
+	if re.match(r'^[a-zA-Z][\.\)]\s', stripped):
+		return True
+	
+	# Roman numerals: i. ii. iii. I. II. III.
+	if re.match(r'^[ivxIVX]{1,5}[\.\)]\s', stripped):
+		return True
+	
+	return False
+
+
+def _segment_columns(blocks: list, page_width: float) -> list[list]:
+	"""
+	Segment blocks into columns using X-coordinate clustering.
+	Returns list of column blocks, sorted left to right.
+	"""
+	if not blocks:
+		return []
+	
+	# Extract x-intervals for each block
+	intervals = []
+	for block in blocks:
+		x0, y0, x1, y1 = block["bbox"]
+		intervals.append((x0, x1, block))
+	
+	# Sort by x0
+	intervals.sort(key=lambda iv: iv[0])
+	
+	# Find column breaks using gap detection
+	# A gap larger than 10% of page width indicates column boundary
+	gap_threshold = page_width * 0.10
+	
+	columns = []
+	current_column = []
+	prev_x1 = None
+	
+	for x0, x1, block in intervals:
+		if prev_x1 is not None and (x0 - prev_x1) > gap_threshold:
+			# Start new column
+			if current_column:
+				columns.append(current_column)
+			current_column = [block]
+		else:
+			current_column.append(block)
+		
+		prev_x1 = max(prev_x1, x1) if prev_x1 is not None else x1
+	
+	if current_column:
+		columns.append(current_column)
+	
+	# Sort each column by Y coordinate (top to bottom)
+	for col in columns:
+		col.sort(key=lambda b: b["bbox"][1])
+	
+	return columns
+
+
+def _group_lines_into_paragraphs(lines: list, page_height: float) -> list[dict]:
+	"""
+	Group lines into paragraph-level blocks based on:
+	- Line height (font size)
+	- Y-gap between lines
+	- Indentation (X-offset)
+	- Bullet detection
+	
+	Returns list of paragraph blocks.
+	"""
+	if not lines:
+		return []
+	
+	paragraphs = []
+	current_para = None
+	
+	for i, line in enumerate(lines):
+		bbox = line["bbox"]
+		text = line["text"]
+		font_size = line["font_size"]
+		x0 = line["line_x0"]
+		
+		y0, y1 = bbox[1], bbox[3]
+		line_height = y1 - y0
+		
+		# Determine if this line starts a new paragraph
+		start_new_para = False
+		
+		if current_para is None:
+			start_new_para = True
+		else:
+			prev_line = current_para["lines"][-1]
+			prev_y1 = prev_line["bbox"][3]
+			prev_x0 = prev_line["line_x0"]
+			prev_font_size = prev_line["font_size"]
+			prev_height = prev_line["bbox"][3] - prev_line["bbox"][1]
+			
+			y_gap = y0 - prev_y1
+			avg_height = (line_height + prev_height) / 2.0
+			
+			# Large vertical gap -> new paragraph
+			if y_gap > avg_height * 0.6:
+				start_new_para = True
+			
+			# Significant indentation change -> new paragraph
+			indent_change = abs(x0 - prev_x0)
+			if indent_change > 15:
+				start_new_para = True
+			
+			# Bullet list item -> new paragraph
+			if _detect_bullet_list(text):
+				start_new_para = True
+			
+			# Font size change -> new paragraph (likely heading or different section)
+			if abs(font_size - prev_font_size) > 1.5:
+				start_new_para = True
+		
+		if start_new_para:
+			if current_para is not None:
+				paragraphs.append(current_para)
+			
+			current_para = {
+				"lines": [line],
+				"bbox": bbox[:],
+				"font_size": font_size,
+				"is_bullet": _detect_bullet_list(text)
+			}
+		else:
+			# Extend current paragraph
+			current_para["lines"].append(line)
+			# Update bounding box
+			pbbox = current_para["bbox"]
+			current_para["bbox"] = [
+				min(pbbox[0], bbox[0]),
+				min(pbbox[1], bbox[1]),
+				max(pbbox[2], bbox[2]),
+				max(pbbox[3], bbox[3])
+			]
+	
+	if current_para is not None:
+		paragraphs.append(current_para)
+	
+	return paragraphs
+
+
+def _merge_paragraph_text(paragraph: dict) -> str:
+	"""
+	Merge lines within a paragraph into final text.
+	Handle soft hyphens and line breaks properly.
+	"""
+	lines = paragraph.get("lines", [])
+	if not lines:
+		return ""
+	
+	text_parts = []
+	
+	for i, line in enumerate(lines):
+		text = line["text"]
+		
+		if i == len(lines) - 1:
+			# Last line - add as is
+			text_parts.append(text)
+		else:
+			# Not last line - check for hyphenation
+			if text.endswith("-"):
+				# Word continues on next line
+				text_parts.append(text[:-1])
+			elif text.endswith((".", "!", "?", ":", ";")):
+				# Sentence ends - add newline
+				text_parts.append(text + "\n")
+			else:
+				# Normal continuation - add space
+				text_parts.append(text + " ")
+	
+	return "".join(text_parts).strip()
+
+
 def extract_layout_blocks(pdf_path: Path):
 	"""
-	Extract page sizes and text blocks (bbox + text + approx font size) using PyMuPDF.
-	Extracts ALL visible text from PDF screen in reading order, including text in images/graphics.
-	DO NOT use OCR - uses PyMuPDF's native text extraction with multiple methods for accuracy.
+	Extract page sizes and text blocks using industry-standard approach.
 	
-	Returns a JSON-serializable dict:
+	Pipeline:
+	1. Extract lines from rawdict (span-level precision)
+	2. Merge lines into paragraphs (line height, indent, y-gap based)
+	3. Segment into columns (X-interval clustering)
+	4. Sort in true reading order (column-wise, top to bottom)
+	5. Suppress duplicates (IoU + text similarity)
+	6. Merge dict blocks for completeness
+	
+	Returns:
 	{
 	  "pages": [
 	    {
 	      "width": float, "height": float,
 	      "blocks": [
-	        {"bbox": [x0,y0,x1,y1], "text": "....", "font_size": 12.3}
+	        {"bbox": [x0,y0,x1,y1], "text": "...", "font_size": 12.3, "text_start_x": x0}
 	      ]
 	    },
 	    ...
@@ -131,171 +436,151 @@ def extract_layout_blocks(pdf_path: Path):
 	pages = []
 	
 	for page_num, page in enumerate(doc):
-		page_info = {"width": float(page.rect.width), "height": float(page.rect.height), "blocks": []}
+		page_width = float(page.rect.width)
+		page_height = float(page.rect.height)
+		page_info = {"width": page_width, "height": page_height, "blocks": []}
 		
-		# Use multiple extraction methods to capture ALL visible text
-		# Method 1: rawdict - preserves exact structure and position
+		# Step 1: Extract all lines from rawdict with span-level detail
 		raw = page.get_text("rawdict")
+		lines = []
 		
-		# Method 2: dict - alternative structure that might catch different text
-		dict_text = page.get_text("dict")
-		
-		# Collect all text blocks with their positions
-		all_blocks = []
-		
-		# Process rawdict blocks (primary method)
-		for b in raw.get("blocks", []):
-			if "lines" not in b:
+		for block in raw.get("blocks", []):
+			if block.get("type") != 0:  # Skip non-text blocks
 				continue
-			x0, y0, x1, y1 = None, None, None, None
-			spans_sizes = []
-			text_parts = []
-			first_line_x0 = None
 			
-			for line_idx, line in enumerate(b.get("lines", [])):
-				line_text_parts = []
-				line_x0 = None
-				for span in line.get("spans", []):
-					t = span.get("text", "") or ""
-					if t.strip():
-						line_text_parts.append(t)
-						spans_sizes.append(float(span.get("size", 0.0) or 0.0))
-						sb = span.get("bbox", None)
-						if sb and len(sb) == 4:
-							sx0, sy0, sx1, sy1 = [float(v) for v in sb]
-							if line_x0 is None:
-								line_x0 = sx0
-							else:
-								line_x0 = min(line_x0, sx0)
-							x0 = sx0 if x0 is None else min(x0, sx0)
-							y0 = sy0 if y0 is None else min(y0, sy0)
-							x1 = sx1 if x1 is None else max(x1, sx1)
-							y1 = sy1 if y1 is None else max(y1, sy1)
+			for line in block.get("lines", []):
+				spans = line.get("spans", [])
+				if not spans:
+					continue
 				
-				if line_text_parts:
-					# Keep line breaks inside the block
-					text_parts.append(" ".join(line_text_parts))
-					if first_line_x0 is None and line_x0 is not None:
-						first_line_x0 = line_x0
-			
-			block_text = "\n".join(text_parts).strip()
-			if not block_text:
+				# Merge spans into line text
+				line_text, line_x0, median_font_size = _merge_spans_in_line(spans)
+				
+				if not line_text.strip():
+					continue
+				
+				# Compute line bounding box
+				line_bbox = line.get("bbox")
+				if not line_bbox or len(line_bbox) != 4:
+					continue
+				
+				x0, y0, x1, y1 = [float(v) for v in line_bbox]
+				
+				lines.append({
+					"bbox": [x0, y0, x1, y1],
+					"text": line_text.strip(),
+					"font_size": median_font_size,
+					"line_x0": line_x0
+				})
+		
+		# Step 2: Group lines into paragraphs
+		paragraphs = _group_lines_into_paragraphs(lines, page_height)
+		
+		# Step 3: Convert paragraphs to blocks
+		raw_blocks = []
+		for para in paragraphs:
+			text = _merge_paragraph_text(para)
+			if not text.strip():
 				continue
-			if x0 is None or y0 is None or x1 is None or y1 is None:
-				continue
 			
-			# Calculate representative font size
-			font_size = 0.0
-			if spans_sizes:
-				sorted_sizes = sorted(spans_sizes)
-				mid = len(sorted_sizes) // 2
-				if len(sorted_sizes) % 2 == 0:
-					font_size = (sorted_sizes[mid - 1] + sorted_sizes[mid]) / 2.0
-				else:
-					font_size = sorted_sizes[mid]
-			
-			all_blocks.append({
-				"bbox": [float(x0), float(y0), float(x1), float(y1)],
-				"text": block_text,
-				"font_size": float(font_size),
-				"text_start_x": float(first_line_x0) if first_line_x0 is not None else float(x0),
-				"source": "rawdict"
+			raw_blocks.append({
+				"bbox": para["bbox"],
+				"text": text,
+				"font_size": para["font_size"],
+				"text_start_x": para["lines"][0]["line_x0"] if para["lines"] else para["bbox"][0],
+				"is_bullet": para.get("is_bullet", False)
 			})
 		
-		# Also check dict blocks for any additional text (e.g., in images/graphics)
-		# This helps catch text that might be embedded in images
-		if dict_text and "blocks" in dict_text:
-			for b in dict_text.get("blocks", []):
-				if b.get("type") == 0:  # Text block
-					bbox = b.get("bbox", [])
-					if len(bbox) == 4 and b.get("lines"):
-						text_lines = []
-						for line in b.get("lines", []):
-							line_text = " ".join([span.get("text", "") for span in line.get("spans", []) if span.get("text", "").strip()])
-							if line_text.strip():
-								text_lines.append(line_text.strip())
-						
-						if text_lines:
-							block_text = "\n".join(text_lines)
-							x0, y0, x1, y1 = bbox
-							
-							# Check if this block overlaps with existing blocks
-							# If it's significantly different, add it
-							is_duplicate = False
-							for existing in all_blocks:
-								ex0, ey0, ex1, ey1 = existing["bbox"]
-								# Check overlap
-								overlap_x = max(0, min(ex1, x1) - max(ex0, x0))
-								overlap_y = max(0, min(ey1, y1) - max(ey0, y0))
-								overlap_area = overlap_x * overlap_y
-								existing_area = (ex1 - ex0) * (ey1 - ey0)
-								new_area = (x1 - x0) * (y1 - y0)
-								
-								# If significant overlap (>80%) and similar text, skip
-								if overlap_area > 0.8 * min(existing_area, new_area):
-									# Check text similarity
-									if block_text.strip().lower() in existing["text"].strip().lower() or existing["text"].strip().lower() in block_text.strip().lower():
-										is_duplicate = True
-										break
-							
-							if not is_duplicate:
-								# Get font size from spans
-								font_size = 12.0  # default
-								for line in b.get("lines", []):
-									for span in line.get("spans", []):
-										if "size" in span:
-											font_size = float(span["size"])
-											break
-									if font_size != 12.0:
-										break
-								
-								all_blocks.append({
-									"bbox": [float(x0), float(y0), float(x1), float(y1)],
-									"text": block_text,
-									"font_size": float(font_size),
-									"text_start_x": float(x0),
-									"source": "dict"
-								})
-		
-		# Sort blocks by reading order: top to bottom, then left to right
-		# This ensures we capture text in the exact order it appears on screen
-		all_blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))  # Sort by y, then x
-		
-		# Remove duplicates and merge very close blocks
-		filtered_blocks = []
-		for block in all_blocks:
-			# Check if this block is too close to previous blocks (likely duplicate)
-			is_duplicate = False
-			for existing in filtered_blocks:
-				ex0, ey0, ex1, ey1 = existing["bbox"]
-				bx0, by0, bx1, by1 = block["bbox"]
+		# Step 4: Add dict blocks for any missing text (e.g., text in images)
+		dict_data = page.get_text("dict")
+		if dict_data and "blocks" in dict_data:
+			for block in dict_data.get("blocks", []):
+				if block.get("type") != 0:
+					continue
 				
-				# Check if blocks are very close vertically and horizontally
-				vertical_distance = abs((ey0 + ey1) / 2 - (by0 + by1) / 2)
-				horizontal_distance = abs((ex0 + ex1) / 2 - (bx0 + bx1) / 2)
+				bbox = block.get("bbox")
+				if not bbox or len(bbox) != 4:
+					continue
 				
-				# If blocks are very close and text is similar, skip
-				if vertical_distance < 5 and horizontal_distance < 50:
-					existing_text = existing["text"].strip().lower()
-					new_text = block["text"].strip().lower()
-					if existing_text == new_text or existing_text in new_text or new_text in existing_text:
+				lines_in_block = block.get("lines", [])
+				if not lines_in_block:
+					continue
+				
+				# Extract text from dict block
+				text_parts = []
+				font_sizes = []
+				for line in lines_in_block:
+					line_text, _, font_size = _merge_spans_in_line(line.get("spans", []))
+					if line_text.strip():
+						text_parts.append(line_text.strip())
+						if font_size > 0:
+							font_sizes.append(font_size)
+				
+				if not text_parts:
+					continue
+				
+				block_text = " ".join(text_parts)
+				median_font_size = sorted(font_sizes)[len(font_sizes) // 2] if font_sizes else 12.0
+				
+				# Check if this block is a duplicate of existing blocks
+				is_duplicate = False
+				for existing in raw_blocks:
+					iou = _compute_iou(bbox, existing["bbox"])
+					text_sim = _text_similarity(block_text, existing["text"])
+					
+					# Duplicate if high IoU and high text similarity
+					if iou > 0.7 or (iou > 0.3 and text_sim > 0.8):
 						is_duplicate = True
 						break
+				
+				if not is_duplicate:
+					raw_blocks.append({
+						"bbox": [float(v) for v in bbox],
+						"text": block_text,
+						"font_size": median_font_size,
+						"text_start_x": float(bbox[0]),
+						"is_bullet": _detect_bullet_list(block_text)
+					})
+		
+		# Step 5: Segment into columns
+		columns = _segment_columns(raw_blocks, page_width)
+		
+		# Step 6: Sort in true reading order (left to right columns, top to bottom within column)
+		ordered_blocks = []
+		for column in columns:
+			# Within each column, already sorted by Y in _segment_columns
+			ordered_blocks.extend(column)
+		
+		# Step 7: Final duplicate suppression using IoU + text similarity
+		final_blocks = []
+		for block in ordered_blocks:
+			is_duplicate = False
+			
+			for existing in final_blocks:
+				iou = _compute_iou(block["bbox"], existing["bbox"])
+				text_sim = _text_similarity(block["text"], existing["text"])
+				
+				# Suppress if:
+				# - Very high IoU (>0.8) OR
+				# - Medium IoU (>0.5) + high text similarity (>0.85)
+				if iou > 0.8 or (iou > 0.5 and text_sim > 0.85):
+					is_duplicate = True
+					break
 			
 			if not is_duplicate:
-				# Clean up the block data for output
-				block_data = {
+				# Clean up block for output
+				final_blocks.append({
 					"bbox": block["bbox"],
 					"text": block["text"],
 					"font_size": block["font_size"],
-					"text_start_x": block["text_start_x"]
-				}
-				filtered_blocks.append(block_data)
+					"text_start_x": block.get("text_start_x", block["bbox"][0])
+				})
 		
-		page_info["blocks"] = filtered_blocks
+		page_info["blocks"] = final_blocks
 		pages.append(page_info)
 		
-		print(f"Page {page_num + 1}: Extracted {len(filtered_blocks)} text blocks (total {len(all_blocks)} before filtering)")
+		num_cols = len(columns)
+		print(f"Page {page_num + 1}: Extracted {len(lines)} lines → {len(paragraphs)} paragraphs → {len(final_blocks)} blocks in {num_cols} column(s)")
 	
 	doc.close()
 	return {"pages": pages}
@@ -1077,85 +1362,201 @@ def render_inpainted_preview_images(pdf_path: Path, layout: dict, out_dir: Path,
 def extract_layout_blocks_ocr(pdf_path: Path):
 	"""
 	Extract text blocks using OCR (Tesseract) for image-based PDFs.
+	Uses industry-standard approach with proper line/paragraph grouping.
+	
+	Pipeline:
+	1. Convert PDF to images (high DPI for better OCR)
+	2. Run Tesseract OCR with word-level bounding boxes
+	3. Group words into lines (Y-coordinate proximity)
+	4. Group lines into paragraphs (Y-gap, indentation)
+	5. Segment into columns (X-interval clustering)
+	6. Sort in true reading order
+	7. Suppress duplicates
+	
 	Returns same structure as extract_layout_blocks.
 	Requires: pytesseract, pdf2image, Pillow, and tesseract binary installed.
 	"""
 	if pytesseract is None or convert_from_path is None:
 		raise RuntimeError("OCR dependencies not installed. Install pytesseract, pdf2image, Pillow")
 	
-	# Convert PDF pages to images
+	# Convert PDF pages to images at higher DPI for better OCR
 	try:
-		images = convert_from_path(str(pdf_path), dpi=150)
+		images = convert_from_path(str(pdf_path), dpi=200)
 	except Exception as e:
 		raise RuntimeError(f"pdf2image conversion failed: {e}")
 	
 	pages = []
-	for img in images:
+	
+	for page_num, img in enumerate(images):
 		width, height = img.size
 		page_info = {"width": float(width), "height": float(height), "blocks": []}
 		
-		# Run OCR with bounding box data
+		# Step 1: Run OCR with word-level bounding boxes
 		try:
 			ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, lang='eng')
 		except Exception as e:
-			# OCR failed for this page, skip
+			print(f"OCR failed for page {page_num + 1}: {e}")
 			pages.append(page_info)
 			continue
 		
-		# Group words into blocks (by line/paragraph)
-		# Simple heuristic: group consecutive words with similar y-coordinates
-		current_block = {"words": [], "bbox": [None, None, None, None], "text": ""}
-		blocks_list = []
-		
+		# Step 2: Extract words with confidence filtering
+		words = []
 		for i in range(len(ocr_data['text'])):
 			text = ocr_data['text'][i].strip()
 			if not text:
 				continue
+			
 			conf = int(ocr_data['conf'][i])
-			if conf < 30:  # Skip low-confidence text
+			if conf < 40:  # Skip low-confidence text
 				continue
 			
-			x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
-			word_bbox = [x, y, x + w, y + h]
+			x = ocr_data['left'][i]
+			y = ocr_data['top'][i]
+			w = ocr_data['width'][i]
+			h = ocr_data['height'][i]
 			
-			# Check if this word is part of current block (similar y-coordinate)
-			if current_block["bbox"][0] is None:
-				# First word in block
-				current_block["bbox"] = word_bbox
-				current_block["words"].append(text)
+			words.append({
+				"text": text,
+				"bbox": [x, y, x + w, y + h],
+				"conf": conf
+			})
+		
+		if not words:
+			pages.append(page_info)
+			continue
+		
+		# Step 3: Group words into lines (Y-coordinate proximity)
+		# Sort words by Y coordinate first
+		words.sort(key=lambda w: (w["bbox"][1], w["bbox"][0]))
+		
+		lines = []
+		current_line = None
+		
+		for word in words:
+			y0 = word["bbox"][1]
+			y1 = word["bbox"][3]
+			line_height = y1 - y0
+			
+			if current_line is None:
+				current_line = {
+					"words": [word],
+					"bbox": word["bbox"][:],
+					"line_height": line_height
+				}
 			else:
-				# Check vertical distance
-				prev_y = current_block["bbox"][1]
-				if abs(y - prev_y) < 15:  # Same line/block (tolerance: 15px)
-					# Extend block bbox
-					current_block["bbox"][0] = min(current_block["bbox"][0], word_bbox[0])
-					current_block["bbox"][1] = min(current_block["bbox"][1], word_bbox[1])
-					current_block["bbox"][2] = max(current_block["bbox"][2], word_bbox[2])
-					current_block["bbox"][3] = max(current_block["bbox"][3], word_bbox[3])
-					current_block["words"].append(text)
+				prev_y0 = current_line["bbox"][1]
+				prev_y1 = current_line["bbox"][3]
+				prev_height = current_line["line_height"]
+				
+				# Check if word is on same line (Y overlap > 50%)
+				overlap_y0 = max(prev_y0, y0)
+				overlap_y1 = min(prev_y1, y1)
+				overlap = max(0, overlap_y1 - overlap_y0)
+				
+				avg_height = (prev_height + line_height) / 2.0
+				
+				if overlap > avg_height * 0.5:
+					# Same line - extend
+					current_line["words"].append(word)
+					current_line["bbox"][0] = min(current_line["bbox"][0], word["bbox"][0])
+					current_line["bbox"][1] = min(current_line["bbox"][1], word["bbox"][1])
+					current_line["bbox"][2] = max(current_line["bbox"][2], word["bbox"][2])
+					current_line["bbox"][3] = max(current_line["bbox"][3], word["bbox"][3])
 				else:
-					# New block
-					if current_block["words"]:
-						current_block["text"] = " ".join(current_block["words"])
-						blocks_list.append(current_block)
-					current_block = {"words": [text], "bbox": word_bbox, "text": ""}
+					# New line
+					lines.append(current_line)
+					current_line = {
+						"words": [word],
+						"bbox": word["bbox"][:],
+						"line_height": line_height
+					}
 		
-		# Add last block
-		if current_block["words"]:
-			current_block["text"] = " ".join(current_block["words"])
-			blocks_list.append(current_block)
+		if current_line is not None:
+			lines.append(current_line)
 		
-		# Convert to page format
-		for b in blocks_list:
-			bbox = b["bbox"]
-			if bbox[0] is not None:
-				page_info["blocks"].append({
-					"bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
-					"text": b["text"],
-					"font_size": 12.0  # default
+		# Step 4: Convert lines to consistent format
+		formatted_lines = []
+		for line in lines:
+			# Sort words in line by X coordinate (left to right)
+			line["words"].sort(key=lambda w: w["bbox"][0])
+			
+			# Merge words into line text
+			text_parts = []
+			for i, word in enumerate(line["words"]):
+				if i > 0:
+					# Check horizontal gap to previous word
+					prev_x1 = line["words"][i-1]["bbox"][2]
+					curr_x0 = word["bbox"][0]
+					gap = curr_x0 - prev_x1
+					
+					# Add space if gap is significant (> 5px)
+					if gap > 5:
+						text_parts.append(" ")
+				
+				text_parts.append(word["text"])
+			
+			line_text = "".join(text_parts).strip()
+			
+			if line_text:
+				formatted_lines.append({
+					"bbox": line["bbox"],
+					"text": line_text,
+					"font_size": line["line_height"],  # Use line height as proxy for font size
+					"line_x0": line["bbox"][0]
 				})
 		
+		# Step 5: Group lines into paragraphs
+		paragraphs = _group_lines_into_paragraphs(formatted_lines, height)
+		
+		# Step 6: Convert paragraphs to blocks
+		raw_blocks = []
+		for para in paragraphs:
+			text = _merge_paragraph_text(para)
+			if not text.strip():
+				continue
+			
+			raw_blocks.append({
+				"bbox": para["bbox"],
+				"text": text,
+				"font_size": para["font_size"],
+				"text_start_x": para["lines"][0]["line_x0"] if para["lines"] else para["bbox"][0],
+				"is_bullet": para.get("is_bullet", False)
+			})
+		
+		# Step 7: Segment into columns
+		columns = _segment_columns(raw_blocks, width)
+		
+		# Step 8: Sort in true reading order
+		ordered_blocks = []
+		for column in columns:
+			ordered_blocks.extend(column)
+		
+		# Step 9: Final duplicate suppression
+		final_blocks = []
+		for block in ordered_blocks:
+			is_duplicate = False
+			
+			for existing in final_blocks:
+				iou = _compute_iou(block["bbox"], existing["bbox"])
+				text_sim = _text_similarity(block["text"], existing["text"])
+				
+				if iou > 0.8 or (iou > 0.5 and text_sim > 0.85):
+					is_duplicate = True
+					break
+			
+			if not is_duplicate:
+				final_blocks.append({
+					"bbox": block["bbox"],
+					"text": block["text"],
+					"font_size": block["font_size"],
+					"text_start_x": block.get("text_start_x", block["bbox"][0])
+				})
+		
+		page_info["blocks"] = final_blocks
 		pages.append(page_info)
+		
+		num_cols = len(columns)
+		print(f"Page {page_num + 1} (OCR): Extracted {len(words)} words → {len(formatted_lines)} lines → {len(paragraphs)} paragraphs → {len(final_blocks)} blocks in {num_cols} column(s)")
 	
 	return {"pages": pages}
 
