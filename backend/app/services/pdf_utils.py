@@ -108,6 +108,9 @@ def create_pdf_from_text(text: str, output_path: Path):
 def extract_layout_blocks(pdf_path: Path):
 	"""
 	Extract page sizes and text blocks (bbox + text + approx font size) using PyMuPDF.
+	Extracts ALL visible text from PDF screen in reading order, including text in images/graphics.
+	DO NOT use OCR - uses PyMuPDF's native text extraction with multiple methods for accuracy.
+	
 	Returns a JSON-serializable dict:
 	{
 	  "pages": [
@@ -126,16 +129,29 @@ def extract_layout_blocks(pdf_path: Path):
 
 	doc = fitz.open(str(pdf_path))
 	pages = []
-	for page in doc:
+	
+	for page_num, page in enumerate(doc):
 		page_info = {"width": float(page.rect.width), "height": float(page.rect.height), "blocks": []}
+		
+		# Use multiple extraction methods to capture ALL visible text
+		# Method 1: rawdict - preserves exact structure and position
 		raw = page.get_text("rawdict")
+		
+		# Method 2: dict - alternative structure that might catch different text
+		dict_text = page.get_text("dict")
+		
+		# Collect all text blocks with their positions
+		all_blocks = []
+		
+		# Process rawdict blocks (primary method)
 		for b in raw.get("blocks", []):
 			if "lines" not in b:
 				continue
 			x0, y0, x1, y1 = None, None, None, None
 			spans_sizes = []
 			text_parts = []
-			first_line_x0 = None  # Track first line's starting x position for alignment
+			first_line_x0 = None
+			
 			for line_idx, line in enumerate(b.get("lines", [])):
 				line_text_parts = []
 				line_x0 = None
@@ -155,18 +171,20 @@ def extract_layout_blocks(pdf_path: Path):
 							y0 = sy0 if y0 is None else min(y0, sy0)
 							x1 = sx1 if x1 is None else max(x1, sx1)
 							y1 = sy1 if y1 is None else max(y1, sy1)
+				
 				if line_text_parts:
-					# keep line breaks inside the block
-					text_parts.append("".join(line_text_parts))
-					# Store first line's x0 for alignment
+					# Keep line breaks inside the block
+					text_parts.append(" ".join(line_text_parts))
 					if first_line_x0 is None and line_x0 is not None:
 						first_line_x0 = line_x0
+			
 			block_text = "\n".join(text_parts).strip()
 			if not block_text:
 				continue
 			if x0 is None or y0 is None or x1 is None or y1 is None:
 				continue
-			# representative font size: median of spans
+			
+			# Calculate representative font size
 			font_size = 0.0
 			if spans_sizes:
 				sorted_sizes = sorted(spans_sizes)
@@ -175,16 +193,110 @@ def extract_layout_blocks(pdf_path: Path):
 					font_size = (sorted_sizes[mid - 1] + sorted_sizes[mid]) / 2.0
 				else:
 					font_size = sorted_sizes[mid]
-			block_data = {
+			
+			all_blocks.append({
 				"bbox": [float(x0), float(y0), float(x1), float(y1)],
 				"text": block_text,
 				"font_size": float(font_size),
-			}
-			# Store first line's x0 for text alignment (if available)
-			if first_line_x0 is not None:
-				block_data["text_start_x"] = float(first_line_x0)
-			page_info["blocks"].append(block_data)
+				"text_start_x": float(first_line_x0) if first_line_x0 is not None else float(x0),
+				"source": "rawdict"
+			})
+		
+		# Also check dict blocks for any additional text (e.g., in images/graphics)
+		# This helps catch text that might be embedded in images
+		if dict_text and "blocks" in dict_text:
+			for b in dict_text.get("blocks", []):
+				if b.get("type") == 0:  # Text block
+					bbox = b.get("bbox", [])
+					if len(bbox) == 4 and b.get("lines"):
+						text_lines = []
+						for line in b.get("lines", []):
+							line_text = " ".join([span.get("text", "") for span in line.get("spans", []) if span.get("text", "").strip()])
+							if line_text.strip():
+								text_lines.append(line_text.strip())
+						
+						if text_lines:
+							block_text = "\n".join(text_lines)
+							x0, y0, x1, y1 = bbox
+							
+							# Check if this block overlaps with existing blocks
+							# If it's significantly different, add it
+							is_duplicate = False
+							for existing in all_blocks:
+								ex0, ey0, ex1, ey1 = existing["bbox"]
+								# Check overlap
+								overlap_x = max(0, min(ex1, x1) - max(ex0, x0))
+								overlap_y = max(0, min(ey1, y1) - max(ey0, y0))
+								overlap_area = overlap_x * overlap_y
+								existing_area = (ex1 - ex0) * (ey1 - ey0)
+								new_area = (x1 - x0) * (y1 - y0)
+								
+								# If significant overlap (>80%) and similar text, skip
+								if overlap_area > 0.8 * min(existing_area, new_area):
+									# Check text similarity
+									if block_text.strip().lower() in existing["text"].strip().lower() or existing["text"].strip().lower() in block_text.strip().lower():
+										is_duplicate = True
+										break
+							
+							if not is_duplicate:
+								# Get font size from spans
+								font_size = 12.0  # default
+								for line in b.get("lines", []):
+									for span in line.get("spans", []):
+										if "size" in span:
+											font_size = float(span["size"])
+											break
+									if font_size != 12.0:
+										break
+								
+								all_blocks.append({
+									"bbox": [float(x0), float(y0), float(x1), float(y1)],
+									"text": block_text,
+									"font_size": float(font_size),
+									"text_start_x": float(x0),
+									"source": "dict"
+								})
+		
+		# Sort blocks by reading order: top to bottom, then left to right
+		# This ensures we capture text in the exact order it appears on screen
+		all_blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))  # Sort by y, then x
+		
+		# Remove duplicates and merge very close blocks
+		filtered_blocks = []
+		for block in all_blocks:
+			# Check if this block is too close to previous blocks (likely duplicate)
+			is_duplicate = False
+			for existing in filtered_blocks:
+				ex0, ey0, ex1, ey1 = existing["bbox"]
+				bx0, by0, bx1, by1 = block["bbox"]
+				
+				# Check if blocks are very close vertically and horizontally
+				vertical_distance = abs((ey0 + ey1) / 2 - (by0 + by1) / 2)
+				horizontal_distance = abs((ex0 + ex1) / 2 - (bx0 + bx1) / 2)
+				
+				# If blocks are very close and text is similar, skip
+				if vertical_distance < 5 and horizontal_distance < 50:
+					existing_text = existing["text"].strip().lower()
+					new_text = block["text"].strip().lower()
+					if existing_text == new_text or existing_text in new_text or new_text in existing_text:
+						is_duplicate = True
+						break
+			
+			if not is_duplicate:
+				# Clean up the block data for output
+				block_data = {
+					"bbox": block["bbox"],
+					"text": block["text"],
+					"font_size": block["font_size"],
+					"text_start_x": block["text_start_x"]
+				}
+				filtered_blocks.append(block_data)
+		
+		page_info["blocks"] = filtered_blocks
 		pages.append(page_info)
+		
+		print(f"Page {page_num + 1}: Extracted {len(filtered_blocks)} text blocks (total {len(all_blocks)} before filtering)")
+	
 	doc.close()
 	return {"pages": pages}
 
@@ -374,6 +486,239 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[
 		return lines if lines else [text]
 
 
+def _calculate_alignment_offset(
+	line_width: float,
+	available_width: float,
+	text_start_x: float,
+	bbox_x0: float,
+	bbox_x1: float,
+) -> float:
+	"""
+	원본 text_start_x를 기반으로 정렬 방식(left/center/right)을 추정하고
+	해당 정렬을 유지하도록 x 오프셋을 계산한다.
+	"""
+	bbox_width = bbox_x1 - bbox_x0
+	if bbox_width <= 0 or available_width <= 0 or line_width >= available_width:
+		return 0.0
+	
+	# 원본에서 텍스트 시작 위치가 bbox 안에서 어느 정도 비율인지 계산
+	original_offset = text_start_x - bbox_x0
+	ratio = original_offset / bbox_width if bbox_width > 0 else 0.0
+	
+	# 절대적인 픽셀 기준도 함께 사용 (스케일 편차 보정)
+	abs_offset = max(0.0, original_offset)
+	
+	# 대략적인 정렬 타입 결정
+	# 1) 거의 왼쪽에 붙어 있는 경우 (좌측 정렬)
+	if abs_offset < 8 or original_offset < bbox_width * 0.25:
+		# 좌측 정렬
+		return 0.0
+	# 2) 중앙 주변
+	elif bbox_width * 0.35 <= original_offset <= bbox_width * 0.65:
+		return max(0.0, (available_width - line_width) / 2.0)
+	# 3) 거의 오른쪽에 붙어 있는 경우 (우측 정렬)
+	elif original_offset > bbox_width * 0.8 or abs_offset > bbox_width - 10:
+		return max(0.0, available_width - line_width)
+	
+	# 그 외의 경우, 원본 비율을 유지하도록 비례 배치
+	target = ratio * available_width
+	# target 위치가 라인의 중앙에 오도록 보정
+	return max(0.0, min(available_width - line_width, target - line_width / 2.0))
+
+
+def _render_block_text(
+	block: dict,
+	draw: ImageDraw.ImageDraw,
+	img_original: np.ndarray,
+	korean_font_path: Optional[str],
+	rendered_areas: list[tuple[float, float, float, float]],
+	min_block_spacing: int,
+	page_index: int,
+	block_index: int,
+	page_height: int,
+	page_width: int,
+) -> Optional[tuple[float, float, float, float]]:
+	"""
+	하나의 텍스트 블록을 고품질로 렌더링한다.
+	- Character-level wrapping (Korean) / word-level (English)
+	- block 높이에 맞게 폰트 크기 자동 조절
+	- 기존 정렬(text_start_x)을 최대한 유지
+	- 이전 블록들과 충돌하면 y 좌표를 아래로 자동 재배치
+	- line_height는 font height * 2.2 배로 넉넉하게
+	"""
+	x0, y0, x1, y1 = block["bbox"]
+	text = (block.get("text") or "").strip()
+	if not text:
+		return None
+	
+	original_font_size = max(8, int(block.get("font_size", 12)))
+	text_start_x = float(block.get("text_start_x", x0))
+	
+	block_width = x1 - x0
+	if block_width <= 4:
+		print(f"Page {page_index + 1}, Block {block_index}: too small -> skip")
+		return None
+	
+	# 텍스트 색상 감지 (원본 이미지 기준)
+	text_color = _detect_text_color(img_original, int(x0), int(y0), int(x1), int(y1))
+	
+	# 페이지 전체 폭 기준 고정 column 사용 (한국어가 길어도 잘리지 않게)
+	COMMON_LEFT = int(page_width * 0.10)  # 페이지 왼쪽 10%
+	COMMON_RIGHT = int(page_width * 0.90)  # 페이지 오른쪽 90%
+	available_width = COMMON_RIGHT - COMMON_LEFT
+	
+	# 내부 margin 설정 (픽셀)
+	v_margin = max(2, int(original_font_size * 0.10))
+	# 높이는 페이지 하단까지 전체를 사용 (블록 높이에 제한 두지 않음)
+	available_height = max(0.0, page_height - (y0 + v_margin))
+	if available_width <= 0 or available_height <= 0:
+		print(f"Page {page_index + 1}, Block {block_index}: no available area")
+		return None
+	
+	# 폰트 로드
+	def load_font(size: int) -> ImageFont.FreeTypeFont:
+		try:
+			if korean_font_path and korean_font_path.endswith(".ttc"):
+				return ImageFont.truetype(korean_font_path, size)
+			if korean_font_path and korean_font_path.endswith(".ttf"):
+				return ImageFont.truetype(korean_font_path, size)
+		except Exception as e:
+			print(f"Page {page_index + 1}, Block {block_index}: font load failed -> {e}")
+		return ImageFont.load_default()
+	
+	# 원본 폰트 크기를 기준으로, 한국어가 더 길 수 있으므로 80~90% 정도로 시작
+	font_size = int(original_font_size * 0.85)
+	min_font_size = max(7, int(original_font_size * 0.4))
+	font = load_font(font_size)
+	
+	line_height = 0.0
+	
+	# 폰트 크기 반복 조절해 블록 안에 전체 텍스트를 fit
+	for _ in range(8):
+		lines = _wrap_text(text, font, int(available_width))
+		if not lines:
+			return None
+		
+		# line height 계산: 원본에 맞게 더 타이트하게 (1.35배)
+		try:
+			ascent, descent = font.getmetrics()
+			base_height = ascent + descent
+			line_height = base_height * 1.35
+		except Exception:
+			try:
+				bbox = font.getbbox("한글Ag")
+				base_height = bbox[3] - bbox[1]
+				line_height = base_height * 1.35
+			except Exception:
+				line_height = font_size * 1.35
+		
+		total_height = line_height * len(lines)
+		if total_height <= available_height:
+			break
+		
+		# fit 되지 않으면 폰트 크기 줄이기
+		scale = (available_height / total_height) * 0.92  # 약간 여유를 둠
+		new_size = max(min_font_size, int(font_size * scale))
+		if new_size >= font_size:
+			# 더 줄일 수 없으면 현재 상태 사용
+			break
+		font_size = new_size
+		font = load_font(font_size)
+	else:
+		# 반복 후에도 맞지 않으면 마지막 상태 사용
+		lines = _wrap_text(text, font, int(available_width))
+		try:
+			ascent, descent = font.getmetrics()
+			base_height = ascent + descent
+			line_height = base_height * 1.35
+		except Exception:
+			line_height = font_size * 1.35
+	
+	if not lines:
+		return None
+	
+	# 기존 블록들과의 충돌을 피하도록 y 위치 조정
+	actual_y0 = y0 + v_margin
+	MIN_SPACING = max(15, min_block_spacing)
+	for prev_x0, prev_y0, prev_x1, prev_y1 in rendered_areas:
+		# 수평으로 일정 부분 이상 겹치면 같은 column 이라고 가정
+		h_overlap = not (x1 < prev_x0 - 5 or x0 > prev_x1 + 5)
+		if not h_overlap:
+			continue
+		# 이전에 렌더링된 어떤 블록과도 겹치지 않도록,
+		# 해당 블록의 하단(prev_y1)보다 최소 한 줄(line_height) 이상 아래에서 시작
+		required = max(MIN_SPACING, int(line_height))
+		if actual_y0 < prev_y1 + required:
+			actual_y0 = prev_y1 + required
+	
+	# 최종 높이 검증, 필요시 일부 줄만 출력 (페이지 하단 기준)
+	max_height = page_height - v_margin - actual_y0
+	if max_height <= 0:
+		return None
+	max_lines = min(len(lines), int(max_height // line_height))
+	if max_lines <= 0:
+		return None
+	if max_lines < len(lines):
+		print(
+			f"Page {page_index + 1}, Block {block_index}: "
+			f"clipping lines {max_lines}/{len(lines)} due to page bottom"
+		)
+		lines = lines[:max_lines]
+	
+	# 실제 렌더링
+	current_y = actual_y0
+	rendered_x0 = x1
+	rendered_x1 = x0
+	first_line_y = current_y
+	last_line_y = current_y
+	
+	for line in lines:
+		if not line.strip():
+			current_y += line_height
+			continue
+		
+		# 라인 폭 계산
+		try:
+			lbbox = font.getbbox(line)
+			line_width = lbbox[2] - lbbox[0]
+		except Exception:
+			line_width = len(line) * font_size * 0.6
+		
+		# 페이지 하단을 넘기면 중단 (line_height는 고정) - 블록 bbox가 아니라 페이지 전체 기준
+		if current_y + line_height > page_height - v_margin:
+			break
+		
+		# 고정 column 시작점(COMMON_LEFT)에서 시작
+		text_x = float(COMMON_LEFT)
+		# 오른쪽이 잘리면 왼쪽 정렬 유지
+		if text_x + line_width > COMMON_RIGHT:
+			# 줄 전체가 column을 넘어가면, 왼쪽부터 시작해서 오른쪽까지만 표시
+			text_x = float(COMMON_LEFT)
+		
+		try:
+			draw.text((int(text_x), int(current_y)), line, fill=text_color, font=font)
+		except Exception as e:
+			print(f"Page {page_index + 1}, Block {block_index}: draw failed -> {e}")
+			break
+		
+		rendered_x0 = min(rendered_x0, text_x)
+		rendered_x1 = max(rendered_x1, text_x + line_width)
+		last_line_y = current_y + line_height
+		current_y += line_height
+	
+	if last_line_y <= first_line_y:
+		return None
+	
+	# 다음 블록을 위한 여유 공간 포함한 영역 반환
+	extra_spacing = max(MIN_SPACING, int(line_height * 0.7))
+	return (
+		rendered_x0 - 2,
+		first_line_y - 2,
+		rendered_x1 + 2,
+		last_line_y + extra_spacing,
+	)
+
+
 def render_high_quality_preview_images(
 	pdf_path: Path, 
 	layout: dict, 
@@ -453,15 +798,20 @@ def render_high_quality_preview_images(
 						rx1 = min(w - 1, int(x1 * sx))
 						ry1 = min(h - 1, int(y1 * sy))
 						
-						# Skip image region detection in backend - render all text blocks
-						# Frontend will handle image region detection for display
-						# Check if this text block is on an image region (DISABLED for now)
-						# if _is_image_region(img, rx0, ry0, rx1, ry1):
-						# 	image_blocks_skipped += 1
-						# 	continue
+						# 1) 이미지 영역 감지: 이미지 위에 있는 텍스트는 렌더링하지 않음
+						if _is_image_region(img, rx0, ry0, rx1, ry1):
+							image_blocks_skipped += 1
+							# inpaint 마스크에서는 그대로 지워서 원본 영어를 제거
+							padding = 1
+							mask_x0 = max(0, rx0 - padding)
+							mask_y0 = max(0, ry0 - padding)
+							mask_x1 = min(w - 1, rx1 + padding)
+							mask_y1 = min(h - 1, ry1 + padding)
+							cv2.rectangle(mask, (mask_x0, mask_y0), (mask_x1, mask_y1), color=255, thickness=-1)  # type: ignore
+							continue
 						
-						# Add to mask for inpaint
-						padding = 3
+						# 2) 일반 텍스트 영역: inpaint 마스크 + 렌더링용 text_blocks 모두 구성
+						padding = 1
 						mask_x0 = max(0, rx0 - padding)
 						mask_y0 = max(0, ry0 - padding)
 						mask_x1 = min(w - 1, rx1 + padding)
@@ -520,12 +870,11 @@ def render_high_quality_preview_images(
 				import traceback
 				traceback.print_exc()
 			
-			# Apply inpaint to remove original text
+			# Apply inpaint to remove original text - minimal processing to reduce blur
 			if mask.any():  # type: ignore
-				kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # type: ignore
-				mask_dilated = cv2.dilate(mask, kernel, iterations=2)  # type: ignore
-				radius = 5
-				img = cv2.inpaint(img, mask_dilated, radius, cv2.INPAINT_NS)  # type: ignore
+				# Use mask directly without dilation for minimal blur
+				radius = 1
+				img = cv2.inpaint(img, mask, radius, cv2.INPAINT_TELEA)  # type: ignore
 			
 			# Convert BGR to RGB for Pillow
 			img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # type: ignore
@@ -552,224 +901,59 @@ def render_high_quality_preview_images(
 			sorted_blocks = sorted(enumerate(text_blocks), key=lambda item: (item[1]["bbox"][1], item[1]["bbox"][0]))
 			
 			# Track rendered text areas to avoid overlaps
-			rendered_areas: List[tuple[float, float, float, float]] = []  # List of (x0, y0, x1, y1) for rendered text
-			# Calculate average font size for spacing calculation
-			avg_font_size = 12  # Default
+			rendered_areas: list[tuple[float, float, float, float]] = []  # (x0, y0, x1, y1)
+			# 전체 블록의 폰트 크기를 기반으로 "본문" 기준 크기 추정
+			# → 가장 작은 본문 폰트 크기(min)를 기준으로 통일하면
+			#   캡션/본문이 섞여 있어도 과도하게 큰 글씨를 피할 수 있다.
+			base_font_size = 12
 			if text_blocks:
-				font_sizes = [int(b.get("font_size", 12)) for b in text_blocks]
-				if font_sizes:
-					avg_font_size = sum(font_sizes) / len(font_sizes)
-			min_block_spacing = max(10, int(avg_font_size * 0.3))  # Minimum spacing between blocks (pixels), proportional to font size
+				all_sizes = [int(b.get("font_size", 12)) for b in text_blocks]
+				if all_sizes:
+					base_font_size = min(all_sizes)
+			
+			# 제목(헤드라인)과 본문을 구분: base_font_size보다 충분히 큰 경우만 제목으로 간주
+			title_threshold = base_font_size * 1.4
+			
+			# 본문 블록들의 공통 시작 x 좌표(컬럼 왼쪽)를 계산하여 정렬 맞추기
+			body_start_xs: list[float] = []
+			for b in text_blocks:
+				fs = float(b.get("font_size", base_font_size))
+				if fs < title_threshold:
+					ts = float(b.get("text_start_x", b["bbox"][0]))
+					body_start_xs.append(ts)
+			common_body_start_x = min(body_start_xs) if body_start_xs else None
+			
+			for b in text_blocks:
+				fs = float(b.get("font_size", base_font_size))
+				# 본문/캡션: 모두 동일한 본문 폰트 크기로 정규화 + 시작 x를 공통 컬럼으로 통일
+				if fs < title_threshold:
+					b["font_size"] = float(base_font_size)
+					if common_body_start_x is not None:
+						b["text_start_x"] = float(common_body_start_x)
+				else:
+					# 제목: 과도하게 크지 않도록 상한선(clamp) 적용
+					max_title_size = base_font_size * 1.6
+					b["font_size"] = float(min(fs, max_title_size))
+			
+			# 블록 간 최소 간격: 본문 폰트 기준으로 한 줄(line_height)의 절반~한 줄 정도 확보
+			avg_font_size = base_font_size
+			min_block_spacing = max(12, int(avg_font_size * 0.9))
 			
 			for sorted_idx, (original_idx, block) in enumerate(sorted_blocks):
-				x0, y0, x1, y1 = block["bbox"]
-				text = block["text"]
-				font_size = int(block["font_size"])
-				block_width = x1 - x0
-				block_height = y1 - y0
-				# Get original text start position if available (for alignment)
-				text_start_x = block.get("text_start_x", x0)
-				
-				if text.strip():
-					# Load font at appropriate size
-					try:
-						if korean_font_path and korean_font_path.endswith('.ttc'):
-							font = ImageFont.truetype(korean_font_path, font_size)
-						elif korean_font_path and korean_font_path.endswith('.ttf'):
-							font = ImageFont.truetype(korean_font_path, font_size)
-						else:
-							font = ImageFont.load_default()
-							print(f"Warning: Using default font for block {original_idx} (Korean font not found)")
-					except Exception as e:
-						font = ImageFont.load_default()
-						print(f"Warning: Failed to load font for block {original_idx}: {e}")
-					
-					# Detect original text color from original image (before inpaint)
-					text_color = _detect_text_color(img_original, x0, y0, x1, y1)
-					
-					# Use appropriate margin to prevent text from touching edges
-					# Margin helps prevent text overlap and improves readability
-					text_margin = max(2, int(font_size * 0.15))  # Margin proportional to font size, minimum 2px
-					# Use 90% of block width to ensure proper margins on both sides
-					available_width = max(int(block_width * 0.90), block_width - text_margin * 2, font_size)
-					lines = _wrap_text(text, font, available_width)
-					
-					# Calculate line height - consistent spacing based on font size
-					# Increase line height significantly to prevent text overlap (especially for Korean with descenders/ascenders)
-					try:
-						bbox = font.getbbox("한글")
-						base_line_height = bbox[3] - bbox[1]
-						# Line height should be proportional to font size for consistency
-						# Use 2.2x spacing to prevent descenders from overlapping with next line's ascenders
-						# Increased to 2.2x for much better spacing and readability
-						line_height = base_line_height * 2.2  # 120% spacing to prevent overlap
-					except:
-						# Fallback if getbbox fails
-						line_height = font_size * 2.2  # 120% spacing to prevent overlap
-					
-					# Calculate total text height needed
-					total_lines = len(lines)
-					total_text_height = total_lines * line_height
-					available_height = block_height - (text_margin * 2)
-					
-					# If text doesn't fit, reduce font size until it fits
-					# Keep adjusting until ALL text fits
-					adjusted_font_size = font_size
-					adjusted_font = font
-					adjusted_line_height = line_height
-					max_iterations = 5
-					iteration = 0
-					
-					while iteration < max_iterations:
-						total_text_height = total_lines * adjusted_line_height
-						
-						if total_text_height <= available_height:
-							# Text fits, we're done
-							break
-						
-						# Calculate scale factor to fit all text
-						scale_factor = available_height / total_text_height
-						# Keep minimum font size reasonable (10px) and preserve original size better
-						min_font_size = max(10, int(font_size * 0.5))  # At least 10px, or 50% of original
-						adjusted_font_size = max(int(adjusted_font_size * scale_factor * 0.95), min_font_size)  # 5% margin
-						
-						# Reload font with adjusted size
-						try:
-							if korean_font_path and korean_font_path.endswith('.ttc'):
-								adjusted_font = ImageFont.truetype(korean_font_path, adjusted_font_size)
-							elif korean_font_path and korean_font_path.endswith('.ttf'):
-								adjusted_font = ImageFont.truetype(korean_font_path, adjusted_font_size)
-							else:
-								adjusted_font = ImageFont.load_default()
-							
-							# Recalculate line height with new font - keep consistent ratio
-							try:
-								bbox = adjusted_font.getbbox("한글")
-								base_line_height = bbox[3] - bbox[1]
-								adjusted_line_height = base_line_height * 2.2  # 120% spacing to prevent overlap
-							except:
-								adjusted_line_height = adjusted_font_size * 2.2  # 120% spacing to prevent overlap
-							
-							# Re-wrap text with adjusted font
-							lines = _wrap_text(text, adjusted_font, available_width)
-							total_lines = len(lines)
-							
-							iteration += 1
-						except Exception as e:
-							print(f"Warning: Failed to adjust font size: {e}")
-							break
-					
-					# Check for overlaps with previously rendered blocks
-					# Adjust y0 if this block overlaps with previous blocks
-					actual_y0 = y0
-					actual_y1 = y1
-					
-					# Calculate estimated text height
-					estimated_text_height = total_lines * adjusted_line_height
-					estimated_y1 = actual_y0 + text_margin + estimated_text_height + text_margin
-					
-					# Check overlap with previous rendered areas - more aggressive detection
-					for prev_x0, prev_y0, prev_x1, prev_y1 in rendered_areas:
-						# Check if blocks overlap horizontally (with some tolerance)
-						horizontal_overlap = not (x1 < prev_x0 - 5 or x0 > prev_x1 + 5)  # 5px tolerance
-						if horizontal_overlap:
-							# Check if this block starts too close to previous block's end
-							# Use larger spacing to prevent any overlap
-							required_spacing = max(min_block_spacing, adjusted_font_size * 0.5)  # At least 50% of font size
-							if actual_y0 < prev_y1 + required_spacing:
-								# Adjust y0 to add spacing
-								actual_y0 = prev_y1 + required_spacing
-								# Recalculate available height
-								available_height = (y1 - actual_y0) - (text_margin * 2)
-								# If available height is too small, reduce font size further
-								if available_height < estimated_text_height:
-									# Reduce font size to fit
-									scale_factor = available_height / estimated_text_height if estimated_text_height > 0 else 1.0
-									adjusted_font_size = max(int(adjusted_font_size * scale_factor * 0.9), max(10, int(font_size * 0.5)))
-									try:
-										if korean_font_path and korean_font_path.endswith('.ttc'):
-											adjusted_font = ImageFont.truetype(korean_font_path, adjusted_font_size)
-										elif korean_font_path and korean_font_path.endswith('.ttf'):
-											adjusted_font = ImageFont.truetype(korean_font_path, adjusted_font_size)
-										else:
-											adjusted_font = ImageFont.load_default()
-										# Recalculate line height
-										try:
-											bbox = adjusted_font.getbbox("한글")
-											base_line_height = bbox[3] - bbox[1]
-											adjusted_line_height = base_line_height * 2.2  # 120% spacing to prevent overlap
-										except:
-											adjusted_line_height = adjusted_font_size * 2.2  # 120% spacing to prevent overlap
-										# Re-wrap text
-										lines = _wrap_text(text, adjusted_font, available_width)
-										total_lines = len(lines)
-										estimated_text_height = total_lines * adjusted_line_height
-									except Exception as e:
-										print(f"Warning: Failed to adjust font for overlap: {e}")
-					
-					# Draw each line - ensure ALL lines are rendered
-					current_y = actual_y0 + text_margin
-					rendered_lines = 0
-					first_line_y = current_y
-					last_line_y = current_y
-					
-					for line_idx, line in enumerate(lines):
-						# Ensure we have space - if not, reduce line height slightly but still render
-						# Add extra spacing between lines to prevent overlap
-						min_line_height = adjusted_font_size * 1.5  # Minimum line height (50% spacing) - increased to prevent overlap
-						if current_y + adjusted_line_height > y1 - text_margin:
-							# Use smaller line height to fit, but still render the line
-							actual_line_height = min(adjusted_line_height, y1 - text_margin - current_y)
-							# Ensure minimum line height to prevent overlap
-							if actual_line_height < min_line_height:
-								# Use minimum line height to prevent text overlap
-								actual_line_height = max(min_line_height, adjusted_font_size * 1.3)  # At least 30% spacing
-						else:
-							actual_line_height = adjusted_line_height
-						
-						# Calculate text width for this line
-						try:
-							line_bbox = adjusted_font.getbbox(line)
-							line_width = line_bbox[2] - line_bbox[0]
-						except:
-							# Fallback: estimate width
-							line_width = len(line) * adjusted_font_size * 0.6
-						
-						# Use original text start position to match alignment
-						# Calculate offset from bbox left edge
-						text_start_offset = text_start_x - x0
-						# Apply same offset to maintain original alignment
-						text_x = x0 + text_start_offset + text_margin
-						
-						# Ensure text doesn't go outside block boundaries
-						if text_x + line_width > x1 - text_margin:
-							# If text is too wide, ensure it doesn't overflow
-							text_x = max(x0 + text_margin, x1 - line_width - text_margin)
-						
-						draw.text((int(text_x), current_y), line, fill=text_color, font=adjusted_font)
-						last_line_y = current_y + actual_line_height
-						current_y += actual_line_height
-						rendered_lines += 1
-					
-					if rendered_lines > 0:
-						# Record the actual rendered area for overlap detection
-						# Use actual rendered bounds with extra padding
-						rendered_text_x0 = min(x0, text_x) - 2  # Small padding
-						rendered_text_x1 = max(x1, text_x + line_width) + 2  # Small padding
-						rendered_text_y0 = first_line_y - 2  # Small padding above
-						# Add extra spacing below to prevent next block from overlapping
-						extra_spacing = max(min_block_spacing, adjusted_font_size * 0.3)
-						rendered_text_y1 = last_line_y + extra_spacing  # Add spacing for next block
-						rendered_areas.append((rendered_text_x0, rendered_text_y0, rendered_text_x1, rendered_text_y1))
-						
-						if rendered_lines < total_lines:
-							print(f"WARNING: Block {original_idx}: Only rendered {rendered_lines}/{total_lines} lines! Missing {total_lines - rendered_lines} lines. Text: '{text[:100]}...'")
-							print(f"  Block size: {block_width}x{block_height}, Font: {adjusted_font_size}px, Available height: {available_height}px")
-						else:
-							print(f"Block {original_idx}: Successfully rendered all {rendered_lines}/{total_lines} lines, font_size={adjusted_font_size}, y_adjust={actual_y0 - y0:.1f}px")
-					else:
-						print(f"ERROR: Block {original_idx}: No lines rendered for text: '{text[:100]}...'")
-						print(f"  Block size: {block_width}x{block_height}, Font: {font_size}px, Available height: {available_height}px")
+				rendered_area = _render_block_text(
+					block=block,
+					draw=draw,
+					img_original=img_original,
+					korean_font_path=korean_font_path,
+					rendered_areas=rendered_areas,
+					min_block_spacing=min_block_spacing,
+					page_index=page_index,
+					block_index=original_idx,
+					page_height=h,
+					page_width=w,
+				)
+				if rendered_area is not None:
+					rendered_areas.append(rendered_area)
 			
 			# Save final image with Korean text
 			out_path = out_dir / f"page_{page_index+1:03d}.png"
@@ -829,8 +1013,8 @@ def render_inpainted_preview_images(pdf_path: Path, layout: dict, out_dir: Path,
 					sy = h / lh if lh else 1.0
 					for b in page_layout.get("blocks", []):
 						x0, y0, x1, y1 = b.get("bbox", [0, 0, 0, 0])
-						# Slightly larger padding for better edge handling
-						padding = 3
+						# Minimal padding to reduce blur area
+						padding = 1
 						rx0 = max(0, int(x0 * sx) - padding)
 						ry0 = max(0, int(y0 * sy) - padding)
 						rx1 = min(w - 1, int(x1 * sx) + padding)
@@ -863,26 +1047,16 @@ def render_inpainted_preview_images(pdf_path: Path, layout: dict, out_dir: Path,
 				except Exception:
 					pass
 				
-				# Dynamic radius: based on average text height, but capped between 2-8
-				# For larger text, use larger radius for smoother blending
-				if avg_height > 0:
-					radius = max(2, min(8, int(avg_height * 0.15)))
-				else:
-					radius = 5  # default
+				# Minimal radius to reduce blur - use smallest possible value
+				radius = 1
 				
-				# Dilate mask more aggressively to ensure text is completely removed
-				# Use a larger kernel and more iterations to cover text edges
-				kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # type: ignore
-				mask_dilated = cv2.dilate(mask, kernel, iterations=2)  # type: ignore
-				
-				# NS method works better for textured/colored backgrounds
-				# It uses Navier-Stokes equations for more natural inpainting
-				# Use larger radius for better text removal
-				inpainted = cv2.inpaint(img, mask_dilated, max(radius, 5), cv2.INPAINT_NS)  # type: ignore
+				# Use mask directly without dilation for minimal blur
+				# TELEA method with minimal radius for least visible blur
+				inpainted = cv2.inpaint(img, mask, radius, cv2.INPAINT_TELEA)  # type: ignore
 				
 				# Ensure text areas are completely removed by applying mask directly
 				# This prevents any residual text from showing through
-				mask_binary = (mask_dilated > 0).astype(np.uint8)  # type: ignore
+				mask_binary = (mask > 0).astype(np.uint8)  # type: ignore
 				if len(img.shape) == 3:
 					mask_3d = np.stack([mask_binary] * 3, axis=2)  # type: ignore
 					# Only use inpainted pixels where mask exists, original elsewhere

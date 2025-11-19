@@ -43,8 +43,9 @@ async def translate_pdf(file: UploadFile = File(...)):
 	if not text.strip():
 		raise HTTPException(status_code=400, detail="PDF에서 추출 가능한 텍스트가 없습니다.")
 
-	# Extract layout blocks (positions) for overlay preview
-	# Try PyMuPDF first, fallback to OCR if no blocks found or too few blocks
+	# Extract layout blocks from PDF screen - DO NOT use OCR
+	# Extract ALL visible text from PDF in reading order using PyMuPDF's native text extraction
+	# This reads the PDF screen directly as a human would, capturing all text including in images/graphics
 	try:
 		layout = extract_layout_blocks(upload_path)
 		total_blocks = sum(len(p.get("blocks", [])) for p in layout.get("pages", []))
@@ -54,255 +55,184 @@ async def translate_pdf(file: UploadFile = File(...)):
 			for p in layout.get("pages", [])
 		)
 		
-		# If too few blocks extracted, try OCR as supplement
-		# OCR is more reliable for complex layouts and images
-		# Lower threshold to catch more cases (5 -> 10)
-		if total_blocks == 0 or non_empty_blocks < 10:
-			print(f"PyMuPDF extracted {total_blocks} blocks ({non_empty_blocks} non-empty), trying OCR...")
-			try:
-				ocr_layout = extract_layout_blocks_ocr(upload_path)
-				ocr_blocks = sum(len(p.get("blocks", [])) for p in ocr_layout.get("pages", []))
-				ocr_non_empty = sum(
-					len([b for b in p.get("blocks", []) if (b.get("text", "") or "").strip()])
-					for p in ocr_layout.get("pages", [])
-				)
-				print(f"OCR extracted {ocr_blocks} blocks ({ocr_non_empty} non-empty)")
-				
-				# Use OCR if it found more blocks
-				if ocr_non_empty > non_empty_blocks:
-					print(f"Using OCR layout (found more blocks: {ocr_non_empty} > {non_empty_blocks})")
-					layout = ocr_layout
-				elif total_blocks == 0:
-					# If PyMuPDF found nothing, use OCR even if it's not perfect
-					print(f"Using OCR layout (PyMuPDF found no blocks)")
-					layout = ocr_layout
-			except Exception as e:
-				print(f"OCR fallback failed: {e}")
-				if total_blocks == 0:
-					layout = {"pages": []}
-		else:
-			print(f"Using PyMuPDF layout ({total_blocks} blocks, {non_empty_blocks} non-empty)")
+		print(f"Extracted {total_blocks} total blocks ({non_empty_blocks} non-empty) from PDF using PyMuPDF native extraction")
+		
+		if total_blocks == 0:
+			raise HTTPException(status_code=400, detail="PDF에서 텍스트를 추출할 수 없습니다. PDF에 텍스트 레이어가 있는지 확인하세요.")
+		
 	except Exception as e:
 		print(f"Error extracting layout blocks: {e}")
-		# Try OCR as last resort
-		try:
-			layout = extract_layout_blocks_ocr(upload_path)
-			print("Using OCR layout (PyMuPDF failed)")
-		except Exception:
-			layout = {"pages": []}
+		import traceback
+		traceback.print_exc()
+		raise HTTPException(status_code=500, detail=f"PDF 텍스트 추출 실패: {e}")
 
-	# Translate full text once
-	try:
-		translated = translate_text(text, target_lang="ko")
-	except Exception as e:
-		raise HTTPException(status_code=500, detail=f"번역 실패: {e}")
-
-	# Map translated text to each layout block
-	# If blocks exist, map paragraph by paragraph; otherwise create synthetic blocks
+	# Translate each block individually in order to maintain 1:1 mapping
+	# This ensures accurate translation matching and preserves original structure
 	try:
 		def _normalize(value: str) -> str:
 			return " ".join((value or "").split())
 
-		def _split_sentences(value: str) -> list[str]:
-			return [seg.strip() for seg in re.split(r'(?<=[.!?\u3002\uFF01\uFF1F])\s+', value) if seg.strip()]
-
-		def _add_pairs(origin_list: list[str], translated_list: list[str], table: dict[str, str]):
-			for origin_text, translated_text in zip(origin_list, translated_list):
-				key = _normalize(origin_text)
-				if key and key not in table:
-					table[key] = translated_text.strip()
-
-		translation_cache: dict[str, str] = {}
-		translation_lookup: dict[str, str] = {}
-		unmatched_entries: list[tuple[str, dict]] = []
-
 		total_blocks = sum(len(p.get("blocks", [])) for p in layout.get("pages", []))
+		# DO NOT use translation cache - translate fresh from original PDF only
+		translated_blocks_text: list[str] = []  # Collect all translated text for full text output
+		translated_blocks_by_position: list[str] = []  # Track translations by position for context
 
 		if total_blocks > 0:
-			# Build lookup table with multiple granularities
-			original_paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-			translated_paragraphs = [p.strip() for p in translated.split("\n\n") if p.strip()]
-			original_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-			translated_lines = [ln.strip() for ln in translated.splitlines() if ln.strip()]
-			original_sentences = _split_sentences(text)
-			translated_sentences = _split_sentences(translated)
-
-			_add_pairs(original_paragraphs, translated_paragraphs, translation_lookup)
-			_add_pairs(original_lines, translated_lines, translation_lookup)
-			_add_pairs(original_sentences, translated_sentences, translation_lookup)
-
-			lookup_items = list(translation_lookup.items())
-
-			for page in layout.get("pages", []):
-				for block in page.get("blocks", []):
+			# Translate each block fresh from original PDF, maintaining exact structure
+			# This ensures 1:1 mapping and preserves original paragraph order, line breaks, and item structure
+			for page_idx, page in enumerate(layout.get("pages", [])):
+				blocks = page.get("blocks", [])
+				
+				for block_idx, block in enumerate(blocks):
 					original_text = (block.get("text", "") or "").strip()
 					if not original_text:
 						block["translated_text"] = ""
+						translated_blocks_by_position.append("")
 						continue
 
 					normalized_text = _normalize(original_text)
 					if not normalized_text:
 						block["translated_text"] = ""
+						translated_blocks_by_position.append("")
 						continue
 
-					# direct match
-					if normalized_text in translation_lookup:
-						block["translated_text"] = translation_lookup[normalized_text]
-						continue
+					# DO NOT use cache - always translate fresh from original
 
-					# fuzzy match (lower threshold for better matching)
-					best_value = ""
-					best_score = 0.0
-					for key, value in lookup_items:
-						score = SequenceMatcher(None, normalized_text.lower(), key.lower()).ratio()
-						if score > best_score:
-							best_score = score
-							best_value = value
-					# Lower threshold from 0.45 to 0.3 for better matching
-					if best_value and best_score >= 0.3 and _normalize(best_value).lower() != normalized_text.lower():
-						translation_lookup[normalized_text] = best_value
-						block["translated_text"] = best_value
-						continue
-
-					# If no match found, add to unmatched entries for individual translation
-					# This ensures ALL text blocks get translated, even if matching fails
-					unmatched_entries.append((normalized_text, {"original": original_text, "block": block}))
-
-			if unmatched_entries:
-				print(f"Found {len(unmatched_entries)} unmatched text blocks, translating with context...")
-				pending: dict[str, dict] = {}
-				for norm, payload in unmatched_entries:
-					if norm not in pending:
-						pending[norm] = {"original": payload["original"], "blocks": []}
-					pending[norm]["blocks"].append(payload["block"])
-
-				# Group blocks by page and position to maintain context
-				# This helps translate related blocks together for better flow
-				page_block_groups: dict[int, list[dict]] = {}
-				for norm, info in pending.items():
-					for blk in info["blocks"]:
-						# Find which page this block belongs to
-						page_idx = -1
-						for idx, page in enumerate(layout.get("pages", [])):
-							if blk in page.get("blocks", []):
-								page_idx = idx
-								break
-						if page_idx not in page_block_groups:
-							page_block_groups[page_idx] = []
-						page_block_groups[page_idx].append({
-							"block": blk,
-							"original": info["original"],
-							"normalized": norm
-						})
-
-				# Translate blocks with context from the same page
-				for page_idx, block_group in page_block_groups.items():
-					# Try to find context from surrounding blocks in the original text
-					context_blocks = []
-					for item in block_group:
-						context_blocks.append(item["original"])
+					# Build context from previously translated blocks (for this page only)
+					# Use already-translated blocks from current page for context
+					prev_translated_context = ""
+					if block_idx > 0 and len(translated_blocks_by_position) > 0:
+						# Get the last 1-2 translated blocks for context
+						prev_contexts = []
+						for i in range(max(0, block_idx - 2), block_idx):
+							if i < len(translated_blocks_by_position) and translated_blocks_by_position[i]:
+								prev_contexts.append(translated_blocks_by_position[i])
+						if prev_contexts:
+							prev_translated_context = " ".join(prev_contexts[-2:])  # Use last 2
 					
-					# Combine context blocks with some spacing
-					context_text = " ".join(context_blocks)
+					# Get next original blocks for context
+					next_original_context = ""
+					if block_idx < len(blocks) - 1:
+						next_texts = []
+						for i in range(block_idx + 1, min(len(blocks), block_idx + 3)):
+							next_text = (blocks[i].get("text", "") or "").strip()
+							if next_text:
+								next_texts.append(next_text)
+						if next_texts:
+							next_original_context = " ".join(next_texts[:2])  # Use first 2
 					
-					# Try to find this context in the original full text for better matching
-					context_normalized = _normalize(context_text)
+					# Build translation prompt with technical document instructions
+					# Always translate fresh - no cache
+					translation_instructions = (
+						"Translate the following text from English to Korean. "
+						"Requirements:\n"
+						"1. Maintain exact paragraph order, line breaks, and item structure from the original\n"
+						"2. Translate 100% accurately - no errors, additions, or omissions\n"
+						"3. Use technical document tone (professional and concise style)\n"
+						"4. Preserve section titles exactly as they appear in the original (e.g., 'Secure and manage your network', 'Power-up CadLink with these options')\n"
+						"5. Do not add any content not in the original\n"
+						"6. Translate all text including any broken characters or missing parts based on the original PDF\n\n"
+					)
 					
-					# Check if we can find a better match in the translated text
-					best_context_match = None
-					best_context_score = 0.0
-					
-					# Look for similar text in original paragraphs (including partial matches)
-					for orig_para, trans_para in zip(original_paragraphs, translated_paragraphs):
-						orig_normalized = _normalize(orig_para)
-						# Check if context is contained in paragraph or vice versa
-						if context_normalized.lower() in orig_normalized.lower():
-							# Context is part of this paragraph, use the translation
-							best_context_score = 1.0
-							best_context_match = trans_para
-							break
-						elif orig_normalized.lower() in context_normalized.lower():
-							# Paragraph is part of context, use the translation
-							score = len(orig_normalized) / len(context_normalized) if context_normalized else 0
-							if score > best_context_score:
-								best_context_score = score
-								best_context_match = trans_para
-						else:
-							# Use similarity score
-							score = SequenceMatcher(None, context_normalized.lower(), orig_normalized.lower()).ratio()
-							if score > best_context_score and score > 0.5:
-								best_context_score = score
-								best_context_match = trans_para
-					
-					# Also check individual blocks against sentences for better matching
-					for item in block_group:
-						norm = item["normalized"]
-						segment = item["original"]
+					# Build context-aware prompt
+					if prev_translated_context or next_original_context:
+						context_parts = []
+						if prev_translated_context and len(prev_translated_context) < 500:
+							context_parts.append(f"Previous context (already translated): {prev_translated_context}")
+						context_parts.append(f"Text to translate: {original_text}")
+						if next_original_context and len(next_original_context) < 500:
+							context_parts.append(f"Following context (original): {next_original_context}")
 						
-						# Try to find partial match in translated sentences
-						best_sentence_match = None
-						best_sentence_score = 0.0
-						segment_normalized = _normalize(segment)
+						translation_prompt = translation_instructions + "\n\n".join(context_parts)
 						
-						for orig_sent, trans_sent in zip(original_sentences, translated_sentences):
-							orig_sent_normalized = _normalize(orig_sent)
-							if segment_normalized.lower() in orig_sent_normalized.lower():
-								best_sentence_score = 1.0
-								best_sentence_match = trans_sent
-								break
-							else:
-								score = SequenceMatcher(None, segment_normalized.lower(), orig_sent_normalized.lower()).ratio()
-								if score > best_sentence_score and score > 0.6:
-									best_sentence_score = score
-									best_sentence_match = trans_sent
+						# Limit prompt size
+						if len(translation_prompt) > 2500:
+							# Simplify to immediate neighbors only
+							context_parts = []
+							if prev_translated_context:
+								context_parts.append(f"Previous: {prev_translated_context[:200]}")
+							context_parts.append(f"Translate: {original_text}")
+							if next_original_context:
+								context_parts.append(f"Following: {next_original_context[:200]}")
+							translation_prompt = translation_instructions + "\n\n".join(context_parts)
+					else:
+						translation_prompt = translation_instructions + f"Text to translate: {original_text}"
+					
+					# Translate fresh from original (no cache)
+					try:
+						print(f"Page {page_idx + 1}, Block {block_idx + 1}: Translating fresh from original ({len(original_text)} chars): '{original_text[:80]}...'")
+						translated_block = translate_text(translation_prompt, target_lang="ko")
 						
-						if best_sentence_match and best_sentence_score > 0.6:
-							item["block"]["translated_text"] = best_sentence_match
-							translation_lookup[norm] = best_sentence_match
-						elif best_context_match and best_context_score > 0.5:
-							# Use context match if available
-							item["block"]["translated_text"] = best_context_match
-							translation_lookup[norm] = best_context_match
-						else:
-							# Translate individually with context awareness
-							if norm in translation_lookup:
-								translated_snippet = translation_lookup[norm]
-							elif norm in translation_cache:
-								translated_snippet = translation_cache[norm]
-							else:
-								try:
-									# Try to translate with surrounding context if available
-									if len(context_blocks) > 1 and len(context_text) < 2000:
-										# Translate the whole context group for better flow
-										context_segment = " ".join(context_blocks)
-										print(f"Translating block group with context ({len(context_segment)} chars): '{context_segment[:100]}...'")
-										context_translated = translate_text(context_segment, target_lang="ko")
-										# Use the context translation for this block
-										translated_snippet = context_translated
-										translation_cache[norm] = translated_snippet
-										translation_lookup[norm] = translated_snippet
-									else:
-										# Single block, translate individually
-										print(f"Translating unmatched block ({len(segment)} chars): '{segment[:100]}...'")
-										translated_snippet = translate_text(segment, target_lang="ko")
-										print(f"Translation result ({len(translated_snippet)} chars): '{translated_snippet[:100]}...'")
-										if not translated_snippet.strip():
-											print(f"Warning: Translation returned empty for block: '{segment[:50]}...'")
-											translated_snippet = segment  # Fallback to original
-										translation_cache[norm] = translated_snippet
-										translation_lookup[norm] = translated_snippet
-								except Exception as e:
-									print(f"Failed to translate unmatched block: {e}")
-									import traceback
-									traceback.print_exc()
-									translated_snippet = segment  # Fallback to original
-									translation_cache[norm] = translated_snippet
-									translation_lookup[norm] = translated_snippet
-							item["block"]["translated_text"] = translated_snippet
-				
-				print(f"Translated {len(pending)} unmatched text blocks (total {sum(len(info['blocks']) for info in pending.values())} blocks updated)")
+						# Extract the translation of the current block
+						# Remove instruction text and context markers if present
+						if "Text to translate:" in translated_block or "Translate:" in translated_block:
+							# Try to extract the main translation part
+							if "Previous" in translated_block and "Following" in translated_block:
+								# Extract middle part
+								parts = translated_block.split("Following")
+								if parts:
+									middle = parts[0].split("Previous")[-1] if "Previous" in translated_block else parts[0]
+									translated_block = middle.strip()
+							elif "Previous" in translated_block:
+								parts = translated_block.split("Previous", 1)
+								if len(parts) > 1:
+									translated_block = parts[1].strip()
+							elif "Following" in translated_block:
+								parts = translated_block.split("Following", 1)
+								if parts:
+									translated_block = parts[0].strip()
+							
+							# Remove instruction markers
+							translated_block = re.sub(r'^(Text to translate|Translate|Previous|Following)( context)?:\s*', '', translated_block, flags=re.IGNORECASE | re.MULTILINE)
+							translated_block = translated_block.strip()
+						
+						# Validate translation
+						if not translated_block or not translated_block.strip():
+							print(f"Warning: Translation returned empty for block, retrying without context")
+							# Retry without context
+							simple_prompt = translation_instructions + f"Text to translate: {original_text}"
+							translated_block = translate_text(simple_prompt, target_lang="ko")
+							if "Text to translate:" in translated_block:
+								translated_block = translated_block.split("Text to translate:", 1)[-1].strip()
+						
+						if not translated_block or not translated_block.strip():
+							print(f"Warning: Translation still empty, using original text")
+							translated_block = original_text
+						
+						# Store translation (but don't use as cache for future blocks)
+						block["translated_text"] = translated_block
+						translated_blocks_text.append(translated_block)
+						translated_blocks_by_position.append(translated_block)
+						
+						print(f"Page {page_idx + 1}, Block {block_idx + 1}: Translated: '{original_text[:50]}...' -> '{translated_block[:50]}...'")
+					except Exception as e:
+						print(f"Error translating block: {e}")
+						import traceback
+						traceback.print_exc()
+						# Fallback: translate without context
+						try:
+							simple_prompt = translation_instructions + f"Text to translate: {original_text}"
+							translated_block = translate_text(simple_prompt, target_lang="ko")
+							if "Text to translate:" in translated_block:
+								translated_block = translated_block.split("Text to translate:", 1)[-1].strip()
+							if not translated_block or not translated_block.strip():
+								translated_block = original_text
+						except:
+							translated_block = original_text
+						
+						block["translated_text"] = translated_block
+						translated_blocks_text.append(translated_block)
+						translated_blocks_by_position.append(translated_block)
+
+			# Create full translated text from blocks (for compatibility with existing code)
+			translated = "\n\n".join(translated_blocks_text)
 		else:
-			# No blocks -> create synthetic blocks with translated text
+			# No blocks -> translate full text and create synthetic blocks
+			try:
+				translated = translate_text(text, target_lang="ko")
+			except Exception as e:
+				raise HTTPException(status_code=500, detail=f"번역 실패: {e}")
+			
 			translated_paragraphs = [p.strip() for p in translated.split("\n\n") if p.strip()]
 			num_pages = len(layout.get("pages", []))
 			if num_pages > 0:
@@ -331,9 +261,50 @@ async def translate_pdf(file: UploadFile = File(...)):
 							}
 						)
 						y_pos += block_height + 10
-	except Exception:
-		# 레이아웃 매핑 실패 시 layout은 빈 상태로 반환
-		pass
+	except Exception as e:
+		print(f"Error in block translation: {e}")
+		import traceback
+		traceback.print_exc()
+		# Fallback: translate full text
+		try:
+			translated = translate_text(text, target_lang="ko")
+		except Exception as e2:
+			raise HTTPException(status_code=500, detail=f"번역 실패: {e2}")
+
+	# 페이지별 영어/한국어 텍스트를 평탄화해서 디버깅/검수에 활용
+	def _build_page_texts(layout_data: dict) -> dict:
+		pages = layout_data.get("pages", [])
+		pages_en: list[list[str]] = []
+		pages_ko: list[list[str]] = []
+		
+		for page in pages:
+			blocks = page.get("blocks", [])
+			# bbox 기준으로 읽기 순서 정렬 (y, x)
+			sorted_blocks = sorted(
+				blocks,
+				key=lambda b: (
+					(b.get("bbox") or [0, 0, 0, 0])[1],
+					(b.get("bbox") or [0, 0, 0, 0])[0],
+				),
+			)
+			en_lines: list[str] = []
+			ko_lines: list[str] = []
+			for b in sorted_blocks:
+				orig = (b.get("text", "") or "").strip()
+				tran = (b.get("translated_text", "") or "").strip()
+				if orig:
+					en_lines.append(orig)
+				# 번역이 없으면 원문을 그대로 남겨서 누락을 쉽게 발견할 수 있게 함
+				if tran:
+					ko_lines.append(tran)
+				elif orig:
+					ko_lines.append(f"[MISSING TRANSLATION] {orig}")
+			pages_en.append(en_lines)
+			pages_ko.append(ko_lines)
+		
+		return {"english": pages_en, "korean": pages_ko}
+
+	page_texts = _build_page_texts(layout)
 
 	# Build high-quality preview images with Korean text rendered
 	# This must be done AFTER translation so that translated_text is available in layout
