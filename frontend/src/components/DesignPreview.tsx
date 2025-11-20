@@ -2,6 +2,8 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 're
 import { LayoutPage } from '../api'
 import html2canvas from 'html2canvas'
 import { jsPDF } from 'jspdf'
+import { Document, Packer, Paragraph, ImageRun, PageBreak, AlignmentType } from 'docx'
+import { saveAs } from 'file-saver'
 
 // pdf.js: bundle worker locally to avoid CORS
 import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist'
@@ -23,6 +25,7 @@ type Props = {
 
 export type DesignPreviewHandle = {
   exportPdf: (filename: string) => Promise<void>
+  exportDocx: (filename: string) => Promise<void>
 }
 
 export const DesignPreview = forwardRef<DesignPreviewHandle, Props>(function DesignPreview(
@@ -67,6 +70,85 @@ export const DesignPreview = forwardRef<DesignPreviewHandle, Props>(function Des
         doc.text('Empty', 40, 40)
       }
       doc.save(filename)
+    },
+    async exportDocx(filename: string) {
+      // 각 페이지 컨테이너를 이미지로 캡처해서 DOCX 페이지에 삽입
+      const children: Paragraph[] = []
+      // 워드 페이지에 맞게 이미지 최대 크기를 제한 (px 기준, 96dpi 가정)
+      // A4 + 기본 여백을 고려해 내용 폭은 약 600px, 높이는 850px 정도로 제한
+      const MAX_WIDTH = 600
+      const MAX_HEIGHT = 850
+
+      for (let i = 0; i < pageContainersRef.current.length; i++) {
+        const el = pageContainersRef.current[i]
+        if (!el) continue
+
+        const canvas = await html2canvas(el, {
+          scale: 2,
+          backgroundColor: '#ffffff',
+          useCORS: true,
+        })
+
+        const blob: Blob = await new Promise((resolve, reject) => {
+          canvas.toBlob(b => {
+            if (!b) {
+              reject(new Error('미리보기 이미지를 생성하지 못했습니다.'))
+              return
+            }
+            resolve(b)
+          }, 'image/png', 0.95)
+        })
+
+        const buffer = await blob.arrayBuffer()
+
+        // 워드 페이지 안에 다 들어가도록 스케일 조정
+        const scale = Math.min(
+          MAX_WIDTH / canvas.width,
+          MAX_HEIGHT / canvas.height,
+          1 // 원본보다 더 키우지는 않음
+        )
+        const targetWidth = Math.round(canvas.width * scale)
+        const targetHeight = Math.round(canvas.height * scale)
+
+        const image = new ImageRun({
+          data: buffer,
+          transformation: {
+            width: targetWidth,
+            height: targetHeight,
+          },
+        })
+
+        children.push(
+          new Paragraph({
+            children: [image],
+            alignment: AlignmentType.CENTER,
+          })
+        )
+
+        // 마지막 페이지가 아니면 페이지 구분
+        if (i < pageContainersRef.current.length - 1) {
+          children.push(
+            new Paragraph({
+              children: [new PageBreak()],
+            })
+          )
+        }
+      }
+
+      if (children.length === 0) {
+        children.push(new Paragraph('내용이 없습니다.'))
+      }
+
+      const document = new Document({
+        sections: [
+          {
+            children,
+          },
+        ],
+      })
+
+      const docBlob = await Packer.toBlob(document)
+      saveAs(docBlob, filename)
     },
   }))
 
@@ -180,6 +262,9 @@ export const DesignPreview = forwardRef<DesignPreviewHandle, Props>(function Des
                     }
                     
                     // 텍스트 블록 영역의 배경이 이미지인지 확인
+                    // 이 검사를 비활성화하여 모든 텍스트를 렌더링
+                    // (백엔드에서 이미 이미지 영역을 inpaint로 처리했으므로 프론트엔드에서 중복 필터링 불필요)
+                    /*
                     try {
                       const sampleLeft = Math.max(0, Math.floor(left))
                       const sampleTop = Math.max(0, Math.floor(top))
@@ -226,10 +311,11 @@ export const DesignPreview = forwardRef<DesignPreviewHandle, Props>(function Des
                         // 밝기 범위 계산
                         const brightnessRange = Math.max(rMax - rMin, gMax - gMin, bMax - bMin)
                         
-                        // 이미지 영역 판단 조건
+                        // 이미지 영역 판단 조건 - 매우 복잡한 이미지만 건너뛰도록 조건 강화
                         const avgBrightness = (rMean + gMean + bMean) / 3
                         const isDark = avgBrightness < 120
-                        const isComplex = avgVariance > 150 || brightnessRange > 80 || (isDark && avgVariance > 50) || brightnessRange > 60
+                        // 조건을 훨씬 더 엄격하게: 분산 3000 이상 AND 밝기범위 200 이상인 경우만
+                        const isComplex = (avgVariance > 3000 && brightnessRange > 200)
                         
                         if (isComplex) {
                           console.log(`Skipping text block on image background (variance: ${avgVariance.toFixed(1)}, brightnessRange: ${brightnessRange}, avgBrightness: ${avgBrightness.toFixed(1)})`)
@@ -239,6 +325,7 @@ export const DesignPreview = forwardRef<DesignPreviewHandle, Props>(function Des
                     } catch (err) {
                       console.warn('Failed to analyze background for text block:', err)
                     }
+                    */
                     
                     // Check for overlaps with previously rendered blocks
                     // Adjust top if this block overlaps with previous blocks

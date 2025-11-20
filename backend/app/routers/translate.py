@@ -34,37 +34,65 @@ async def translate_pdf(file: UploadFile = File(...)):
 	with open(upload_path, "wb") as f:
 		f.write(await file.read())
 
-	# Extract text
+	# 1단계: 기본 텍스트 추출 시도 (텍스트 레이어가 있는 PDF)
 	try:
 		text = extract_text_from_pdf(upload_path)
 	except Exception as e:
 		raise HTTPException(status_code=400, detail=f"PDF 텍스트 추출 실패: {e}")
 
-	if not text.strip():
-		raise HTTPException(status_code=400, detail="PDF에서 추출 가능한 텍스트가 없습니다.")
+	layout = None
 
-	# Extract layout blocks from PDF screen - DO NOT use OCR
-	# Extract ALL visible text from PDF in reading order using PyMuPDF's native text extraction
-	# This reads the PDF screen directly as a human would, capturing all text including in images/graphics
-	try:
-		layout = extract_layout_blocks(upload_path)
-		total_blocks = sum(len(p.get("blocks", [])) for p in layout.get("pages", []))
-		# Count non-empty text blocks
-		non_empty_blocks = sum(
-			len([b for b in p.get("blocks", []) if (b.get("text", "") or "").strip()])
-			for p in layout.get("pages", [])
-		)
-		
-		print(f"Extracted {total_blocks} total blocks ({non_empty_blocks} non-empty) from PDF using PyMuPDF native extraction")
-		
-		if total_blocks == 0:
-			raise HTTPException(status_code=400, detail="PDF에서 텍스트를 추출할 수 없습니다. PDF에 텍스트 레이어가 있는지 확인하세요.")
-		
-	except Exception as e:
-		print(f"Error extracting layout blocks: {e}")
-		import traceback
-		traceback.print_exc()
-		raise HTTPException(status_code=500, detail=f"PDF 텍스트 추출 실패: {e}")
+	# 2단계: PyMuPDF 기반 레이아웃 추출 우선 사용
+	# (텍스트 레이어가 있는 일반 PDF)
+	if text.strip():
+		try:
+			layout = extract_layout_blocks(upload_path)
+			total_blocks = sum(len(p.get("blocks", [])) for p in layout.get("pages", []))
+			# Count non-empty text blocks
+			non_empty_blocks = sum(
+				len([b for b in p.get("blocks", []) if (b.get("text", "") or "").strip()])
+				for p in layout.get("pages", [])
+			)
+			
+			print(f"Extracted {total_blocks} total blocks ({non_empty_blocks} non-empty) from PDF using PyMuPDF native extraction")
+			
+			if total_blocks == 0:
+				# 레이아웃 블록이 전혀 없으면 OCR로 재시도
+				layout = None
+		except Exception as e:
+			print(f"Error extracting layout blocks (native): {e}")
+			import traceback
+			traceback.print_exc()
+			layout = None
+
+	# 3단계: 텍스트 레이어가 없거나, 레이아웃 블록이 없는 경우 → OCR 기반 추출로 폴백
+	if not text.strip() or layout is None:
+		print("No extractable text or layout from native method, falling back to OCR-based extraction.")
+		try:
+			layout = extract_layout_blocks_ocr(upload_path)
+			# OCR 레이아웃에서 전체 텍스트를 다시 구성
+			pages = layout.get("pages", [])
+			blocks_text: list[str] = []
+			for p in pages:
+				for b in p.get("blocks", []):
+					t = (b.get("text", "") or "").strip()
+					if t:
+						blocks_text.append(t)
+			text = "\n\n".join(blocks_text)
+
+			if not text.strip():
+				raise HTTPException(status_code=400, detail="PDF에서 추출 가능한 텍스트가 없습니다. (이미지 기반 PDF)")
+
+			total_blocks = sum(len(p.get("blocks", [])) for p in layout.get("pages", []))
+			print(f"Extracted {total_blocks} blocks from PDF using OCR-based extraction")
+		except HTTPException:
+			# 위에서 이미 의미 있는 메시지로 래이즈 한 경우 그대로 전달
+			raise
+		except Exception as e:
+			print(f"Error extracting layout blocks with OCR: {e}")
+			import traceback
+			traceback.print_exc()
+			raise HTTPException(status_code=500, detail=f"OCR 기반 PDF 텍스트 추출 실패: {e}")
 
 	# Translate each block individually in order to maintain 1:1 mapping
 	# This ensures accurate translation matching and preserves original structure
@@ -121,27 +149,28 @@ async def translate_pdf(file: UploadFile = File(...)):
 						if next_texts:
 							next_original_context = " ".join(next_texts[:2])  # Use first 2
 					
-					# Build translation prompt with technical document instructions
+					# Build translation prompt with natural Korean emphasis
 					# Always translate fresh - no cache
 					translation_instructions = (
-						"Translate the following text from English to Korean. "
-						"Requirements:\n"
-						"1. Maintain exact paragraph order, line breaks, and item structure from the original\n"
-						"2. Translate 100% accurately - no errors, additions, or omissions\n"
-						"3. Use technical document tone (professional and concise style)\n"
-						"4. Preserve section titles exactly as they appear in the original (e.g., 'Secure and manage your network', 'Power-up CadLink with these options')\n"
-						"5. Do not add any content not in the original\n"
-						"6. Translate all text including any broken characters or missing parts based on the original PDF\n\n"
+						"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요.\n\n"
+						"번역 원칙:\n"
+						"1. 【직역 금지】 의미를 정확히 전달하는 자연스러운 한국어로 의역\n"
+						"2. 【자연스러운 어순】 한국어 어순에 맞게 문장 구조 재배치\n"
+						"3. 【읽기 쉽게】 전문 용어도 이해하기 쉽게 번역\n"
+						"4. 【문맥 고려】 문맥에 맞는 적절한 한국어 표현 사용\n"
+						"5. 【구조 유지】 문단, 줄바꿈, 리스트 구조는 원본과 동일하게\n"
+						"6. 【완전성】 모든 내용 번역, 추가 내용 없음\n"
+						"7. 【자연스러운 종결】 제목은 체언형, 본문은 '~합니다/됩니다/있습니다' 등 자연스러운 종결어미 사용\n\n"
 					)
 					
 					# Build context-aware prompt
 					if prev_translated_context or next_original_context:
 						context_parts = []
 						if prev_translated_context and len(prev_translated_context) < 500:
-							context_parts.append(f"Previous context (already translated): {prev_translated_context}")
-						context_parts.append(f"Text to translate: {original_text}")
+							context_parts.append(f"[이전 문맥 - 이미 번역됨]: {prev_translated_context}")
+						context_parts.append(f"[번역할 텍스트]: {original_text}")
 						if next_original_context and len(next_original_context) < 500:
-							context_parts.append(f"Following context (original): {next_original_context}")
+							context_parts.append(f"[다음 문맥 - 원문]: {next_original_context}")
 						
 						translation_prompt = translation_instructions + "\n\n".join(context_parts)
 						
@@ -150,13 +179,13 @@ async def translate_pdf(file: UploadFile = File(...)):
 							# Simplify to immediate neighbors only
 							context_parts = []
 							if prev_translated_context:
-								context_parts.append(f"Previous: {prev_translated_context[:200]}")
-							context_parts.append(f"Translate: {original_text}")
+								context_parts.append(f"[이전]: {prev_translated_context[:200]}")
+							context_parts.append(f"[번역]: {original_text}")
 							if next_original_context:
-								context_parts.append(f"Following: {next_original_context[:200]}")
+								context_parts.append(f"[다음]: {next_original_context[:200]}")
 							translation_prompt = translation_instructions + "\n\n".join(context_parts)
 					else:
-						translation_prompt = translation_instructions + f"Text to translate: {original_text}"
+						translation_prompt = translation_instructions + f"[번역할 텍스트]: {original_text}"
 					
 					# Translate fresh from original (no cache)
 					try:
@@ -165,24 +194,44 @@ async def translate_pdf(file: UploadFile = File(...)):
 						
 						# Extract the translation of the current block
 						# Remove instruction text and context markers if present
-						if "Text to translate:" in translated_block or "Translate:" in translated_block:
+						markers_to_remove = [
+							"[번역할 텍스트]:", "[번역]:", "[이전 문맥", "[다음 문맥", "[이전]:", "[다음]:",
+							"Text to translate:", "Translate:", "Previous", "Following"
+						]
+						
+						# Check if any markers are present
+						has_markers = any(marker in translated_block for marker in markers_to_remove)
+						
+						if has_markers:
 							# Try to extract the main translation part
-							if "Previous" in translated_block and "Following" in translated_block:
-								# Extract middle part
-								parts = translated_block.split("Following")
+							if "[이전" in translated_block and "[다음" in translated_block:
+								# Extract middle part between markers
+								parts = translated_block.split("[다음")
 								if parts:
-									middle = parts[0].split("Previous")[-1] if "Previous" in translated_block else parts[0]
+									middle = parts[0].split("[이전")[-1]
 									translated_block = middle.strip()
-							elif "Previous" in translated_block:
-								parts = translated_block.split("Previous", 1)
+							elif "[이전" in translated_block:
+								parts = translated_block.split("[이전", 1)
 								if len(parts) > 1:
-									translated_block = parts[1].strip()
-							elif "Following" in translated_block:
-								parts = translated_block.split("Following", 1)
+									# Get everything after the marker
+									after_marker = parts[1]
+									# Remove the marker line (up to first newline or colon)
+									if "]:" in after_marker:
+										translated_block = after_marker.split("]:", 1)[-1].strip()
+									elif "\n" in after_marker:
+										translated_block = after_marker.split("\n", 1)[-1].strip()
+									else:
+										translated_block = after_marker.strip()
+							elif "[다음" in translated_block:
+								parts = translated_block.split("[다음", 1)
 								if parts:
 									translated_block = parts[0].strip()
 							
-							# Remove instruction markers
+							# Remove any remaining instruction markers using regex
+							translated_block = re.sub(r'\[번역할 텍스트\]:?\s*', '', translated_block)
+							translated_block = re.sub(r'\[번역\]:?\s*', '', translated_block)
+							translated_block = re.sub(r'\[이전[^\]]*\]:?[^\n]*\n?', '', translated_block)
+							translated_block = re.sub(r'\[다음[^\]]*\]:?[^\n]*\n?', '', translated_block)
 							translated_block = re.sub(r'^(Text to translate|Translate|Previous|Following)( context)?:\s*', '', translated_block, flags=re.IGNORECASE | re.MULTILINE)
 							translated_block = translated_block.strip()
 						
@@ -190,10 +239,12 @@ async def translate_pdf(file: UploadFile = File(...)):
 						if not translated_block or not translated_block.strip():
 							print(f"Warning: Translation returned empty for block, retrying without context")
 							# Retry without context
-							simple_prompt = translation_instructions + f"Text to translate: {original_text}"
+							simple_prompt = translation_instructions + f"[번역할 텍스트]: {original_text}"
 							translated_block = translate_text(simple_prompt, target_lang="ko")
-							if "Text to translate:" in translated_block:
-								translated_block = translated_block.split("Text to translate:", 1)[-1].strip()
+							# Clean up markers
+							translated_block = re.sub(r'\[번역할 텍스트\]:?\s*', '', translated_block)
+							translated_block = re.sub(r'^(Text to translate|번역할 텍스트):?\s*', '', translated_block, flags=re.IGNORECASE)
+							translated_block = translated_block.strip()
 						
 						if not translated_block or not translated_block.strip():
 							print(f"Warning: Translation still empty, using original text")
@@ -211,10 +262,12 @@ async def translate_pdf(file: UploadFile = File(...)):
 						traceback.print_exc()
 						# Fallback: translate without context
 						try:
-							simple_prompt = translation_instructions + f"Text to translate: {original_text}"
+							simple_prompt = translation_instructions + f"[번역할 텍스트]: {original_text}"
 							translated_block = translate_text(simple_prompt, target_lang="ko")
-							if "Text to translate:" in translated_block:
-								translated_block = translated_block.split("Text to translate:", 1)[-1].strip()
+							# Clean up markers
+							translated_block = re.sub(r'\[번역할 텍스트\]:?\s*', '', translated_block)
+							translated_block = re.sub(r'^(Text to translate|번역할 텍스트):?\s*', '', translated_block, flags=re.IGNORECASE)
+							translated_block = translated_block.strip()
 							if not translated_block or not translated_block.strip():
 								translated_block = original_text
 						except:

@@ -4,7 +4,6 @@ import { generatePdfFromText } from './pdf'
 import { PdfUploader } from './components/PdfUploader'
 import { TranslationResult } from './components/TranslationResult'
 import { DesignPreview, type DesignPreviewHandle } from './components/DesignPreview'
-// docx와 file-saver는 동적 import로 처리 (빌드 최적화)
 
 function App() {
   const [originalText, setOriginalText] = useState<string>('')
@@ -100,114 +99,13 @@ function App() {
   const handlePreviewWordDownload = async () => {
     const base = originalFileName?.replace(/\.[^/.]+$/, '') || 'document'
     const out = `translated_layout_${base}.docx`
-    setError('')
-    setDownloading(true)
     try {
-      if (!preview?.id || !preview?.count) {
-        throw new Error('미리보기 이미지가 없습니다.')
-      }
-
-      console.log('[미리보기 Word 다운로드] 시작:', { previewId: preview.id, pageCount: preview.count })
-      
-      // docx와 file-saver를 동적으로 import
-      const { Document, Packer, Paragraph, ImageRun } = await import('docx')
-      const { saveAs } = await import('file-saver')
-      
-      // 미리보기 이미지들을 가져와서 Word 문서에 삽입
-      const children: any[] = []
-      
-      for (let pageIndex = 1; pageIndex <= preview.count; pageIndex++) {
-        const imageUrl = getPreviewImageUrl(preview.id, pageIndex)
-        console.log(`[미리보기 Word 다운로드] 페이지 ${pageIndex} 이미지 로드 중:`, imageUrl)
-        
-        try {
-          // 이미지 가져오기
-          const response = await fetch(imageUrl)
-          if (!response.ok) {
-            console.warn(`페이지 ${pageIndex} 이미지를 가져올 수 없습니다.`)
-            continue
-          }
-          const blob = await response.blob()
-          const arrayBuffer = await blob.arrayBuffer()
-          
-          // 이미지 크기 가져오기
-          const img = new Image()
-          const imgUrl = URL.createObjectURL(blob)
-          await new Promise((resolve, reject) => {
-            img.onload = resolve
-            img.onerror = reject
-            img.src = imgUrl
-          })
-          
-          // A4 크기 (595 x 842 points)에 맞춰 비율 유지하며 조정
-          const maxWidth = 595 // A4 width in points
-          const maxHeight = 842 // A4 height in points
-          let width = img.width
-          let height = img.height
-          
-          // 비율 계산 (points로 변환: 1px ≈ 0.75pt)
-          const scale = Math.min(maxWidth / (width * 0.75), maxHeight / (height * 0.75), 1)
-          width = width * 0.75 * scale
-          height = height * 0.75 * scale
-          
-          URL.revokeObjectURL(imgUrl)
-          
-          // Word 문서에 이미지 추가
-          children.push(
-            new Paragraph({
-              children: [
-                new ImageRun({
-                  data: arrayBuffer,
-                  transformation: {
-                    width: Math.round(width),
-                    height: Math.round(height),
-                  },
-                }),
-              ],
-            })
-          )
-          
-          // 페이지 간 간격 추가 (마지막 페이지 제외)
-          if (pageIndex < preview.count) {
-            children.push(
-              new Paragraph({
-                text: '',
-                spacing: { after: 200 },
-              })
-            )
-          }
-        } catch (e: any) {
-          console.error(`페이지 ${pageIndex} 처리 중 오류:`, e)
-          // 오류가 발생해도 다음 페이지 계속 처리
-        }
-      }
-      
-      if (children.length === 0) {
-        throw new Error('이미지를 불러올 수 없습니다.')
-      }
-      
-      // Word 문서 생성
-      const doc = new Document({
-        sections: [
-          {
-            properties: {},
-            children: children,
-          },
-        ],
-      })
-      
-      // Word 문서 저장
-      const blob = await Packer.toBlob(doc)
-      saveAs(blob, out)
-      
-      console.log('[미리보기 Word 다운로드] 완료')
+      await previewRef.current?.exportDocx(out)
     } catch (e: any) {
-      console.error('[미리보기 Word 다운로드] 오류:', e)
-      setError(e?.message ?? '미리보기 Word 다운로드 중 오류가 발생했습니다.')
-    } finally {
-      setDownloading(false)
+      setError(e?.message ?? '미리보기 워드 생성 중 오류가 발생했습니다.')
     }
   }
+
 
   return (
     <div className="container" style={{ paddingLeft: '0', paddingRight: '0', marginLeft: '0', marginRight: '0', textAlign: 'left' }}>
@@ -294,39 +192,13 @@ function App() {
       )}
       {previewMode && uploadId && (
         <div style={{ marginTop: 12, marginLeft: '0', paddingLeft: '0' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, marginLeft: '0', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, marginLeft: '0' }}>
             <button onClick={() => setPreviewMode(false)}>← 번역 텍스트 보기</button>
-            <button 
-              onClick={handlePreviewDownload} 
-              disabled={!layout || !layout?.pages?.length}
-              style={{
-                background: '#f5f5f5',
-                color: '#000000',
-                border: '1px solid #cccccc',
-                padding: '0.5rem 1rem',
-                borderRadius: '6px',
-                cursor: (!layout || !layout?.pages?.length) ? 'not-allowed' : 'pointer',
-                fontSize: '0.9rem',
-                opacity: (!layout || !layout?.pages?.length) ? 0.5 : 1
-              }}
-            >
+            <button onClick={handlePreviewDownload} disabled={!layout || !layout?.pages?.length}>
               PDF로 다운로드
             </button>
-            <button 
-              onClick={handlePreviewWordDownload} 
-              disabled={!preview?.id || !preview?.count || downloading}
-              style={{
-                background: '#f5f5f5',
-                color: '#000000',
-                border: '1px solid #cccccc',
-                padding: '0.5rem 1rem',
-                borderRadius: '6px',
-                cursor: (!preview?.id || !preview?.count || downloading) ? 'not-allowed' : 'pointer',
-                fontSize: '0.9rem',
-                opacity: (!preview?.id || !preview?.count || downloading) ? 0.5 : 1
-              }}
-            >
-              Word로 다운로드
+            <button onClick={handlePreviewWordDownload} disabled={!layout || !layout?.pages?.length}>
+              워드로 다운로드
             </button>
           </div>
           <DesignPreview
