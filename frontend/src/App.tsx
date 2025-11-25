@@ -188,7 +188,7 @@ function App() {
                   width: `${Math.min(uploadProgress, 100)}%`,
                   height: '100%',
                   transition: 'width 0.2s ease',
-                  background: 'linear-gradient(90deg, #4f46e5, #6366f1)',
+                  background: 'linear-gradient(90deg, #138577, #0f766e)',
                 }}
               />
             </div>
@@ -245,7 +245,7 @@ function App() {
                 justifyContent: 'center',
                 fontSize: '24px',
                 fontWeight: 'bold',
-                color: '#4f46e5',
+                color: '#138577',
                 fontFamily: 'system-ui, sans-serif',
                 whiteSpace: 'nowrap'
               }}
@@ -334,7 +334,7 @@ function App() {
           style={{
             padding: '10px 20px',
             fontSize: 16,
-            backgroundColor: finetuningStatus?.can_train ? '#4f46e5' : '#9ca3af',
+            backgroundColor: finetuningStatus?.can_train ? '#138577' : '#9ca3af',
             color: 'white',
             border: 'none',
             borderRadius: 6,
@@ -391,7 +391,20 @@ function App() {
       {!previewMode && (
         <>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
-            <button onClick={() => setPreviewMode(true)} disabled={!uploadId || !layout}>
+            <button 
+              onClick={() => setPreviewMode(true)} 
+              disabled={!uploadId || !layout}
+              style={{
+                backgroundColor: (!uploadId || !layout) ? '#9ca3af' : '#138577',
+                color: '#ffffff',
+                border: 'none',
+                padding: '0.6rem 1rem',
+                borderRadius: '6px',
+                cursor: (!uploadId || !layout) ? 'not-allowed' : 'pointer',
+                fontSize: '14px',
+                fontWeight: 500,
+              }}
+            >
               → 원본 디자인 미리보기
             </button>
           </div>
@@ -414,11 +427,51 @@ function App() {
       {previewMode && uploadId && (
         <div style={{ marginTop: 12, marginLeft: '0', paddingLeft: '0' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, marginLeft: '0' }}>
-            <button onClick={() => setPreviewMode(false)}>← 번역 텍스트 보기</button>
-            <button onClick={handlePreviewDownload} disabled={!layout || !layout?.pages?.length}>
+            <button 
+              onClick={() => setPreviewMode(false)}
+              style={{
+                backgroundColor: '#138577',
+                color: '#ffffff',
+                border: 'none',
+                padding: '0.6rem 1rem',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: 500,
+              }}
+            >
+              ← 번역 텍스트 보기
+            </button>
+            <button 
+              onClick={handlePreviewDownload} 
+              disabled={!layout || !layout?.pages?.length}
+              style={{
+                backgroundColor: (!layout || !layout?.pages?.length) ? '#9ca3af' : '#14b8a6',
+                color: '#ffffff',
+                border: 'none',
+                padding: '0.6rem 1rem',
+                borderRadius: '6px',
+                cursor: (!layout || !layout?.pages?.length) ? 'not-allowed' : 'pointer',
+                fontSize: '14px',
+                fontWeight: 500,
+              }}
+            >
               PDF로 다운로드
             </button>
-            <button onClick={handlePreviewWordDownload} disabled={!layout || !layout?.pages?.length}>
+            <button 
+              onClick={handlePreviewWordDownload} 
+              disabled={!layout || !layout?.pages?.length}
+              style={{
+                backgroundColor: (!layout || !layout?.pages?.length) ? '#9ca3af' : '#14b8a6',
+                color: '#ffffff',
+                border: 'none',
+                padding: '0.6rem 1rem',
+                borderRadius: '6px',
+                cursor: (!layout || !layout?.pages?.length) ? 'not-allowed' : 'pointer',
+                fontSize: '14px',
+                fontWeight: 500,
+              }}
+            >
               워드로 다운로드
             </button>
           </div>

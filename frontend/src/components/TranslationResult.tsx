@@ -165,7 +165,7 @@ export function TranslationResult({
             style={{
               width: '100%',
               padding: '12px 24px',
-              backgroundColor: isSaving ? '#9ca3af' : '#3b82f6',
+              backgroundColor: isSaving ? '#9ca3af' : '#138577',
               color: '#ffffff',
               border: 'none',
               borderRadius: '8px',
@@ -176,12 +176,12 @@ export function TranslationResult({
             }}
             onMouseEnter={(e) => {
               if (!isSaving && originalText.trim()) {
-                e.currentTarget.style.backgroundColor = '#2563eb'
+                e.currentTarget.style.backgroundColor = '#0f766e'
               }
             }}
             onMouseLeave={(e) => {
               if (!isSaving && originalText.trim()) {
-                e.currentTarget.style.backgroundColor = '#3b82f6'
+                e.currentTarget.style.backgroundColor = '#138577'
               }
             }}
           >
