@@ -77,11 +77,18 @@ export function getTextOverlayUrl(previewId: string, pageIndex1Based: number, te
 
 export async function uploadAndTranslatePdf(
   file: File,
-  onProgress?: (percent: number) => void
+  onProgress?: (percent: number) => void,
+  useFinetuned?: boolean,
+  finetunedModelId?: string | null
 ): Promise<TranslateResponse> {
   return new Promise((resolve, reject) => {
   const formData = new FormData()
   formData.append('file', file)
+  // 파인튜닝 모델 사용 옵션 추가
+  if (useFinetuned && finetunedModelId) {
+    formData.append('use_finetuned', 'true')
+    formData.append('finetuned_model_id', finetunedModelId)
+  }
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${API_BASE}/api/translate/pdf`)
     xhr.responseType = 'json'

@@ -22,3 +22,4 @@ SHOW CREATE TABLE translations;
 SELECT '마이그레이션 완료! MEDIUMTEXT로 변경되었습니다.' AS result;
 
 
+

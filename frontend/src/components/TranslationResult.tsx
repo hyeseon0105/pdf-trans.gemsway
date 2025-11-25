@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { saveTranslation } from '../api'
+import * as XLSX from 'xlsx'
 
 type Props = {
   originalText: string
@@ -77,7 +78,7 @@ export function TranslationResult({
       <div className="result-header">
         <h2>번역 결과</h2>
         <button onClick={onDownload} disabled={!canDownload}>
-          PDF로 다운로드
+          엑셀로 다운로드
         </button>
       </div>
       <div style={{
@@ -130,7 +131,7 @@ export function TranslationResult({
         </div>
         <div>
           <h3 style={{ margin: '0 0 8px 0', fontSize: '16px', fontWeight: 600, color: '#000000' }}>
-            내가 직접 번역
+            직접 번역
           </h3>
           <textarea
             value={userTranslation}

@@ -2,8 +2,9 @@ import re
 import uuid
 from pathlib import Path
 from difflib import SequenceMatcher
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Body
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -24,9 +25,28 @@ router = APIRouter()
 
 
 @router.post("/translate/pdf")
-async def translate_pdf(file: UploadFile = File(...)):
+async def translate_pdf(
+	file: UploadFile = File(...),
+	use_finetuned: Optional[str] = Form(None),
+	finetuned_model_id: Optional[str] = Form(None)
+):
+	"""
+	PDF 번역 엔드포인트
+	
+	Args:
+		file: PDF 파일
+		use_finetuned: 파인튜닝 모델 사용 여부 ("true" 문자열 또는 None, 기본값: False, 항상 gpt-4o-mini 사용)
+		finetuned_model_id: 파인튜닝 모델 ID (use_finetuned="true"일 때 필수)
+	"""
 	if file.content_type != "application/pdf":
 		raise HTTPException(status_code=400, detail="PDF 파일만 업로드할 수 있습니다.")
+	
+	# FormData에서 받은 문자열을 boolean으로 변환
+	use_finetuned_bool = use_finetuned and use_finetuned.lower() == "true"
+	
+	# 파인튜닝 모델 사용 시 모델 ID 확인
+	if use_finetuned_bool and not finetuned_model_id:
+		raise HTTPException(status_code=400, detail="파인튜닝 모델을 사용하려면 finetuned_model_id가 필요합니다.")
 
 	# Save upload
 	upload_id = str(uuid.uuid4())
@@ -106,8 +126,105 @@ async def translate_pdf(file: UploadFile = File(...)):
 		translated_blocks_by_position: list[str] = []  # Track translations by position for context
 
 		if total_blocks > 0:
-			# Translate each block fresh from original PDF, maintaining exact structure
-			# This ensures 1:1 mapping and preserves original paragraph order, line breaks, and item structure
+			# 배치 번역을 위한 블록 수집
+			# 작은 블록들을 묶어서 한 번에 번역하여 속도 향상
+			all_blocks_info: list[tuple[int, int, dict, str]] = []  # (page_idx, block_idx, block, text)
+			
+			for page_idx, page in enumerate(layout.get("pages", [])):
+				blocks = page.get("blocks", [])
+				for block_idx, block in enumerate(blocks):
+					original_text = (block.get("text", "") or "").strip()
+					if original_text:
+						normalized_text = _normalize(original_text)
+						if normalized_text:
+							all_blocks_info.append((page_idx, block_idx, block, original_text))
+			
+			# 배치 크기 설정: 작은 블록들을 묶어서 번역 (최대 3000자까지)
+			batch_size = 3000
+			current_batch: list[tuple[int, int, dict, str]] = []
+			current_batch_size = 0
+			
+			def _translate_batch(batch: list[tuple[int, int, dict, str]], batch_num: int) -> dict[tuple[int, int], str]:
+				"""배치의 블록들을 한 번에 번역"""
+				if not batch:
+					return {}
+				
+				# 배치의 모든 텍스트를 하나로 묶기
+				batch_texts = [text for _, _, _, text in batch]
+				combined_text = "\n\n---BLOCK_SEPARATOR---\n\n".join(batch_texts)
+				
+				translation_instructions = (
+					"다음 영어 텍스트들을 자연스러운 한국어로 번역해주세요.\n\n"
+					"번역 원칙:\n"
+					"1. 【직역 금지】 의미를 정확히 전달하는 자연스러운 한국어로 의역\n"
+					"2. 【자연스러운 어순】 한국어 어순에 맞게 문장 구조 재배치\n"
+					"3. 【읽기 쉽게】 전문 용어도 이해하기 쉽게 번역\n"
+					"4. 【문맥 고려】 문맥에 맞는 적절한 한국어 표현 사용\n"
+					"5. 【구조 유지】 문단, 줄바꿈, 리스트 구조는 원본과 동일하게\n"
+					"6. 【완전성】 모든 내용 번역, 추가 내용 없음\n"
+					"7. 【자연스러운 종결】 제목은 체언형, 본문은 '~합니다/됩니다/있습니다' 등 자연스러운 종결어미 사용\n\n"
+					"---BLOCK_SEPARATOR---로 구분된 각 텍스트 블록을 개별적으로 번역하고, "
+					"번역 결과도 동일한 구분자로 구분해주세요.\n\n"
+					f"번역할 텍스트:\n{combined_text}"
+				)
+				
+				try:
+					translated_batch = translate_text(
+						translation_instructions, 
+						target_lang="ko",
+						use_finetuned=use_finetuned_bool,
+						finetuned_model_id=finetuned_model_id
+					)
+					
+					# 구분자로 분리
+					translated_parts = translated_batch.split("---BLOCK_SEPARATOR---")
+					
+					# 결과 매핑
+					result = {}
+					for idx, (page_idx, block_idx, block, _) in enumerate(batch):
+						if idx < len(translated_parts):
+							translated_text = translated_parts[idx].strip()
+							# 구분자 주변의 공백/줄바꿈 제거
+							translated_text = re.sub(r'^[\s\n\-]+|[\s\n\-]+$', '', translated_text)
+							result[(page_idx, block_idx)] = translated_text
+						else:
+							# 번역 결과가 부족하면 개별 번역 시도
+							try:
+								simple_prompt = translation_instructions.split("번역할 텍스트:")[0] + f"번역할 텍스트:\n{batch[idx][3]}"
+								result[(page_idx, block_idx)] = translate_text(
+									simple_prompt, 
+									target_lang="ko",
+									use_finetuned=use_finetuned_bool,
+									finetuned_model_id=finetuned_model_id
+								).strip()
+							except:
+								result[(page_idx, block_idx)] = ""
+					
+					return result
+				except Exception as e:
+					print(f"Error translating batch {batch_num}: {e}")
+					# 배치 실패 시 개별 번역으로 폴백
+					result = {}
+					for page_idx, block_idx, block, text in batch:
+						try:
+							simple_prompt = (
+								"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요.\n\n"
+								f"번역할 텍스트:\n{text}"
+							)
+							result[(page_idx, block_idx)] = translate_text(
+								simple_prompt, 
+								target_lang="ko",
+								use_finetuned=use_finetuned_bool,
+								finetuned_model_id=finetuned_model_id
+							).strip()
+						except:
+							result[(page_idx, block_idx)] = ""
+					return result
+			
+			# 배치 단위로 번역 처리
+			translated_results: dict[tuple[int, int], str] = {}
+			batch_num = 0
+			
 			for page_idx, page in enumerate(layout.get("pages", [])):
 				blocks = page.get("blocks", [])
 				
@@ -123,176 +240,103 @@ async def translate_pdf(file: UploadFile = File(...)):
 						block["translated_text"] = ""
 						translated_blocks_by_position.append("")
 						continue
-
-					# DO NOT use cache - always translate fresh from original
-
-					# Build context from previously translated blocks (for this page only)
-					# Use already-translated blocks from current page for context
-					prev_translated_context = ""
-					if block_idx > 0 and len(translated_blocks_by_position) > 0:
-						# Get the last 1-2 translated blocks for context
-						prev_contexts = []
-						for i in range(max(0, block_idx - 2), block_idx):
-							if i < len(translated_blocks_by_position) and translated_blocks_by_position[i]:
-								prev_contexts.append(translated_blocks_by_position[i])
-						if prev_contexts:
-							prev_translated_context = " ".join(prev_contexts[-2:])  # Use last 2
 					
-					# Get next original blocks for context
-					next_original_context = ""
-					if block_idx < len(blocks) - 1:
-						next_texts = []
-						for i in range(block_idx + 1, min(len(blocks), block_idx + 3)):
-							next_text = (blocks[i].get("text", "") or "").strip()
-							if next_text:
-								next_texts.append(next_text)
-						if next_texts:
-							next_original_context = " ".join(next_texts[:2])  # Use first 2
-					
-					# Build translation prompt with natural Korean emphasis
-					# Always translate fresh - no cache
-					translation_instructions = (
-						"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요.\n\n"
-						"번역 원칙:\n"
-						"1. 【직역 금지】 의미를 정확히 전달하는 자연스러운 한국어로 의역\n"
-						"2. 【자연스러운 어순】 한국어 어순에 맞게 문장 구조 재배치\n"
-						"3. 【읽기 쉽게】 전문 용어도 이해하기 쉽게 번역\n"
-						"4. 【문맥 고려】 문맥에 맞는 적절한 한국어 표현 사용\n"
-						"5. 【구조 유지】 문단, 줄바꿈, 리스트 구조는 원본과 동일하게\n"
-						"6. 【완전성】 모든 내용 번역, 추가 내용 없음\n"
-						"7. 【자연스러운 종결】 제목은 체언형, 본문은 '~합니다/됩니다/있습니다' 등 자연스러운 종결어미 사용\n\n"
-					)
-					
-					# Build context-aware prompt
-					if prev_translated_context or next_original_context:
-						context_parts = []
-						if prev_translated_context and len(prev_translated_context) < 500:
-							context_parts.append(f"[이전 문맥 - 이미 번역됨]: {prev_translated_context}")
-						context_parts.append(f"[번역할 텍스트]: {original_text}")
-						if next_original_context and len(next_original_context) < 500:
-							context_parts.append(f"[다음 문맥 - 원문]: {next_original_context}")
+					# 큰 블록(300자 이상)은 개별 번역
+					if len(original_text) >= 300:
+						# 현재 배치가 있으면 먼저 처리
+						if current_batch:
+							batch_num += 1
+							batch_results = _translate_batch(current_batch, batch_num)
+							translated_results.update(batch_results)
+							current_batch = []
+							current_batch_size = 0
 						
-						translation_prompt = translation_instructions + "\n\n".join(context_parts)
-						
-						# Limit prompt size
-						if len(translation_prompt) > 2500:
-							# Simplify to immediate neighbors only
-							context_parts = []
-							if prev_translated_context:
-								context_parts.append(f"[이전]: {prev_translated_context[:200]}")
-							context_parts.append(f"[번역]: {original_text}")
-							if next_original_context:
-								context_parts.append(f"[다음]: {next_original_context[:200]}")
-							translation_prompt = translation_instructions + "\n\n".join(context_parts)
-					else:
-						translation_prompt = translation_instructions + f"[번역할 텍스트]: {original_text}"
-					
-					# Translate fresh from original (no cache)
-					try:
-						print(f"Page {page_idx + 1}, Block {block_idx + 1}: Translating fresh from original ({len(original_text)} chars): '{original_text[:80]}...'")
-						translated_block = translate_text(translation_prompt, target_lang="ko")
-						
-						# Extract the translation of the current block
-						# Remove instruction text and context markers if present
-						markers_to_remove = [
-							"[번역할 텍스트]:", "[번역]:", "[이전 문맥", "[다음 문맥", "[이전]:", "[다음]:",
-							"Text to translate:", "Translate:", "Previous", "Following"
-						]
-						
-						# Check if any markers are present
-						has_markers = any(marker in translated_block for marker in markers_to_remove)
-						
-						if has_markers:
-							# Try to extract the main translation part
-							if "[이전" in translated_block and "[다음" in translated_block:
-								# Extract middle part between markers
-								parts = translated_block.split("[다음")
-								if parts:
-									middle = parts[0].split("[이전")[-1]
-									translated_block = middle.strip()
-							elif "[이전" in translated_block:
-								parts = translated_block.split("[이전", 1)
-								if len(parts) > 1:
-									# Get everything after the marker
-									after_marker = parts[1]
-									# Remove the marker line (up to first newline or colon)
-									if "]:" in after_marker:
-										translated_block = after_marker.split("]:", 1)[-1].strip()
-									elif "\n" in after_marker:
-										translated_block = after_marker.split("\n", 1)[-1].strip()
-									else:
-										translated_block = after_marker.strip()
-							elif "[다음" in translated_block:
-								parts = translated_block.split("[다음", 1)
-								if parts:
-									translated_block = parts[0].strip()
-							
-							# Remove any remaining instruction markers using regex
-							translated_block = re.sub(r'\[번역할 텍스트\]:?\s*', '', translated_block)
-							translated_block = re.sub(r'\[번역\]:?\s*', '', translated_block)
-							translated_block = re.sub(r'\[이전[^\]]*\]:?[^\n]*\n?', '', translated_block)
-							translated_block = re.sub(r'\[다음[^\]]*\]:?[^\n]*\n?', '', translated_block)
-							translated_block = re.sub(r'^(Text to translate|Translate|Previous|Following)( context)?:\s*', '', translated_block, flags=re.IGNORECASE | re.MULTILINE)
-							translated_block = translated_block.strip()
-						
-						# Validate translation
-						if not translated_block or not translated_block.strip():
-							print(f"Warning: Translation returned empty for block, retrying without context")
-							# Retry without context
-							simple_prompt = translation_instructions + f"[번역할 텍스트]: {original_text}"
-							translated_block = translate_text(simple_prompt, target_lang="ko")
-							# Clean up markers
-							translated_block = re.sub(r'\[번역할 텍스트\]:?\s*', '', translated_block)
-							translated_block = re.sub(r'^(Text to translate|번역할 텍스트):?\s*', '', translated_block, flags=re.IGNORECASE)
-							translated_block = translated_block.strip()
-						
-						if not translated_block or not translated_block.strip():
-							print(f"Warning: Translation still empty, will retry translation")
-							# 원본 텍스트를 사용하지 않고 다시 번역 시도
-							try:
-								translated_block = translate_text(original_text, target_lang="ko")
-								if not translated_block or not translated_block.strip():
-									print(f"Error: Translation failed completely for block")
-									continue  # 이 블록은 건너뜀
-							except Exception as retry_e:
-								print(f"Error: Retry translation failed: {retry_e}")
-								continue  # 이 블록은 건너뜀
-						
-						# Store translation (but don't use as cache for future blocks)
-						block["translated_text"] = translated_block
-						translated_blocks_text.append(translated_block)
-						translated_blocks_by_position.append(translated_block)
-						
-						print(f"Page {page_idx + 1}, Block {block_idx + 1}: Translated: '{original_text[:50]}...' -> '{translated_block[:50]}...'")
-					except Exception as e:
-						print(f"Error translating block: {e}")
-						import traceback
-						traceback.print_exc()
-						# Fallback: translate without context
+						# 큰 블록은 개별 번역
 						try:
-							simple_prompt = translation_instructions + f"[번역할 텍스트]: {original_text}"
-							translated_block = translate_text(simple_prompt, target_lang="ko")
-							# Clean up markers
+							translation_instructions = (
+								"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요.\n\n"
+								"번역 원칙:\n"
+								"1. 【직역 금지】 의미를 정확히 전달하는 자연스러운 한국어로 의역\n"
+								"2. 【자연스러운 어순】 한국어 어순에 맞게 문장 구조 재배치\n"
+								"3. 【읽기 쉽게】 전문 용어도 이해하기 쉽게 번역\n"
+								"4. 【문맥 고려】 문맥에 맞는 적절한 한국어 표현 사용\n"
+								"5. 【구조 유지】 문단, 줄바꿈, 리스트 구조는 원본과 동일하게\n"
+								"6. 【완전성】 모든 내용 번역, 추가 내용 없음\n"
+								"7. 【자연스러운 종결】 제목은 체언형, 본문은 '~합니다/됩니다/있습니다' 등 자연스러운 종결어미 사용\n\n"
+								f"번역할 텍스트:\n{original_text}"
+							)
+							translated_block = translate_text(
+								translation_instructions, 
+								target_lang="ko",
+								use_finetuned=use_finetuned_bool,
+								finetuned_model_id=finetuned_model_id
+							)
+							# 마커 제거
 							translated_block = re.sub(r'\[번역할 텍스트\]:?\s*', '', translated_block)
 							translated_block = re.sub(r'^(Text to translate|번역할 텍스트):?\s*', '', translated_block, flags=re.IGNORECASE)
 							translated_block = translated_block.strip()
-							if not translated_block or not translated_block.strip():
-								print(f"Error: Translation failed for block, skipping")
-								continue  # 이 블록은 건너뜀
-						except Exception as retry_e2:
-							print(f"Error: Final retry translation failed: {retry_e2}")
-							continue  # 이 블록은 건너뜀
+							translated_results[(page_idx, block_idx)] = translated_block
+						except Exception as e:
+							print(f"Error translating large block: {e}")
+							translated_results[(page_idx, block_idx)] = ""
+					else:
+						# 작은 블록은 배치에 추가
+						text_len = len(original_text)
+						if current_batch_size + text_len > batch_size and current_batch:
+							# 배치가 가득 찼으면 번역
+							batch_num += 1
+							batch_results = _translate_batch(current_batch, batch_num)
+							translated_results.update(batch_results)
+							current_batch = []
+							current_batch_size = 0
 						
+						current_batch.append((page_idx, block_idx, block, original_text))
+						current_batch_size += text_len + 50  # 구분자 공간 고려
+				
+				# 페이지가 끝날 때 현재 배치 처리
+				if current_batch:
+					batch_num += 1
+					batch_results = _translate_batch(current_batch, batch_num)
+					translated_results.update(batch_results)
+					current_batch = []
+					current_batch_size = 0
+			
+			# 남은 배치 처리
+			if current_batch:
+				batch_num += 1
+				batch_results = _translate_batch(current_batch, batch_num)
+				translated_results.update(batch_results)
+			
+			# 결과를 블록에 할당
+			for page_idx, page in enumerate(layout.get("pages", [])):
+				blocks = page.get("blocks", [])
+				for block_idx, block in enumerate(blocks):
+					original_text = (block.get("text", "") or "").strip()
+					if not original_text:
+						continue
+					
+					key = (page_idx, block_idx)
+					if key in translated_results:
+						translated_block = translated_results[key]
 						block["translated_text"] = translated_block
-						translated_blocks_text.append(translated_block)
-						translated_blocks_by_position.append(translated_block)
-
+						if translated_block:
+							translated_blocks_text.append(translated_block)
+							translated_blocks_by_position.append(translated_block)
+					else:
+						block["translated_text"] = ""
+						translated_blocks_by_position.append("")
+			
 			# Create full translated text from blocks (for compatibility with existing code)
 			translated = "\n\n".join(translated_blocks_text)
 		else:
 			# No blocks -> translate full text and create synthetic blocks
 			try:
-				translated = translate_text(text, target_lang="ko")
+				translated = translate_text(
+					text, 
+					target_lang="ko",
+					use_finetuned=use_finetuned_bool,
+					finetuned_model_id=finetuned_model_id
+				)
 			except Exception as e:
 				raise HTTPException(status_code=500, detail=f"번역 실패: {e}")
 			
@@ -330,7 +374,12 @@ async def translate_pdf(file: UploadFile = File(...)):
 		traceback.print_exc()
 		# Fallback: translate full text
 		try:
-			translated = translate_text(text, target_lang="ko")
+			translated = translate_text(
+				text, 
+				target_lang="ko",
+				use_finetuned=use_finetuned_bool,
+				finetuned_model_id=finetuned_model_id
+			)
 		except Exception as e2:
 			raise HTTPException(status_code=500, detail=f"번역 실패: {e2}")
 
@@ -493,9 +542,9 @@ async def review_translation_endpoint(request: ReviewRequest):
 		if not original_text.strip():
 			raise HTTPException(status_code=400, detail="원문 PDF에서 텍스트를 추출할 수 없습니다.")
 		
-		# 번역문이 없으면 번역 수행
+		# 번역문이 없으면 번역 수행 (기본 모델 사용)
 		if not request.translated_text:
-			translated_text = translate_text(original_text, target_lang="ko")
+			translated_text = translate_text(original_text, target_lang="ko", use_finetuned=False)
 		else:
 			translated_text = request.translated_text
 		

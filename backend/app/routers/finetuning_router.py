@@ -231,79 +231,12 @@ async def get_finetuning_job_status(job_id: str):
             "error": job.error if hasattr(job, 'error') else None
         }
         
-        # 학습이 완료되었고 모델 ID가 있으면 .env 파일 업데이트 시도
+        # 학습이 완료되었고 모델 ID가 있으면 메시지에 포함
         if job.status == "succeeded" and job.fine_tuned_model:
-            try:
-                update_env_file(job.fine_tuned_model)
-                result["env_updated"] = True
-                result["message"] = f"✅ 학습 완료! 모델 ID가 .env 파일에 자동 업데이트되었습니다: {job.fine_tuned_model}"
-            except Exception as e:
-                result["env_updated"] = False
-                result["env_update_error"] = str(e)
-                result["message"] = f"✅ 학습 완료! 모델 ID: {job.fine_tuned_model}\n⚠️ .env 파일 자동 업데이트 실패. 수동으로 OPENAI_MODEL={job.fine_tuned_model} 추가하세요."
+            result["message"] = f"✅ 학습 완료! 모델 ID: {job.fine_tuned_model}\n\n이 모델은 '학습하기' 버튼을 눌렀을 때만 사용됩니다.\n일반 번역은 항상 gpt-4o-mini를 사용합니다."
         
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"작업 상태 확인 실패: {str(e)}")
 
-
-def update_env_file(model_id: str) -> bool:
-    """학습 완료된 모델 ID를 .env 파일에 자동 업데이트"""
-    try:
-        # Docker 컨테이너 내부에서 호스트의 .env 파일 찾기
-        # 방법 1: /workspace 볼륨 마운트 경로 사용 (docker-compose.yml에서 마운트된 경우)
-        workspace_env = Path("/workspace/.env")
-        # 방법 2: 프로젝트 루트 경로 (로컬 개발 환경)
-        project_root = Path(__file__).resolve().parent.parent.parent.parent
-        local_env = project_root / ".env"
-        
-        # 먼저 /workspace 경로 확인 (Docker 환경)
-        if workspace_env.exists():
-            env_file = workspace_env
-            print(f"[INFO] Docker 환경에서 .env 파일 발견: {env_file}")
-        elif local_env.exists():
-            env_file = local_env
-            print(f"[INFO] 로컬 환경에서 .env 파일 발견: {env_file}")
-        else:
-            # .env 파일이 없으면 프로젝트 루트에 생성 시도
-            env_file = local_env if not workspace_env.parent.exists() else workspace_env
-            print(f"[INFO] .env 파일이 없어 새로 생성합니다: {env_file}")
-        
-        if not env_file.exists():
-            # .env 파일이 없으면 생성
-            with open(env_file, "w", encoding="utf-8") as f:
-                f.write(f"OPENAI_MODEL={model_id}\n")
-            print(f"[INFO] .env 파일 생성 및 모델 ID 추가: {model_id}")
-            return True
-        
-        # .env 파일 읽기
-        lines = []
-        found_openai_model = False
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                # OPENAI_MODEL 라인은 모두 건너뛰고 나중에 하나만 추가
-                if line.strip().startswith("OPENAI_MODEL="):
-                    found_openai_model = True
-                    continue  # 기존 OPENAI_MODEL 라인은 모두 제거
-                else:
-                    lines.append(line)
-        
-        # OPENAI_MODEL이 없었거나 제거되었으면 추가
-        # 주석과 함께 추가 (맨 끝에 추가)
-        if not lines or lines[-1].strip() != "":
-            lines.append("\n")
-        lines.append(f"# Fine-tuned 모델 (자동 업데이트됨: {model_id})\n")
-        lines.append(f"OPENAI_MODEL={model_id}\n")
-        
-        # .env 파일 쓰기
-        with open(env_file, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-        
-        print(f"[INFO] .env 파일 업데이트 완료: OPENAI_MODEL={model_id}")
-        return True
-    except Exception as e:
-        print(f"[ERROR] .env 파일 업데이트 실패: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
 

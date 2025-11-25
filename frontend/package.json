@@ -9,13 +9,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "docx": "^8.5.0",
+    "file-saver": "^2.0.5",
+    "html2canvas": "^1.4.1",
     "jspdf": "^2.5.1",
     "pdfjs-dist": "^4.5.136",
-    "html2canvas": "^1.4.1",
-    "docx": "^8.5.0",
-    "file-saver": "^2.0.5"
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/react": "^18.3.5",
@@ -25,5 +26,3 @@
     "vite": "^5.4.8"
   }
 }
-
-

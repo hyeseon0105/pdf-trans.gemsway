@@ -1,6 +1,7 @@
 import os
 import logging
 from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -86,32 +87,23 @@ def _chunk_paragraphs(text: str, max_chunk_chars: int = 6000) -> List[str]:
 	return chunks
 
 
-def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
+def _translate_with_openai(text: str, target_lang: str = "ko", use_finetuned: bool = False, finetuned_model_id: Optional[str] = None) -> Optional[str]:
 	client = _get_openai_client()
 	if client is None:
 		return None
-	# 기본값을 고품질 GPT-4 계열 모델로 설정 (환경 변수로 언제든지 override 가능)
-	# 예) OPENAI_MODEL=gpt-4.1 또는 OPENAI_MODEL=gpt-4o
-	# Fine-tuned 모델 ID가 유효한지 확인 (ft:로 시작하는 경우)
-	model_env = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 	
-	# Fine-tuned 모델 ID가 예시 값이거나 유효하지 않으면 기본 모델 사용
-	# 예시 값: abc123, example, test 등이 포함된 경우
-	invalid_patterns = ["abc123", "example", "test", "your-org", "your-model"]
-	is_invalid_finetuned = (
-		model_env.startswith("ft:") and 
-		any(pattern in model_env.lower() for pattern in invalid_patterns)
-	)
-	
-	if is_invalid_finetuned:
-		# 예시 모델 ID이므로 기본 모델 사용
-		logger.warning(f"Fine-tuned 모델 ID가 예시 값입니다. 기본 모델을 사용합니다: {model_env}")
-		model = "gpt-4o-mini"
+	# 기본 모델은 항상 gpt-4o-mini로 고정
+	# 파인튜닝 모델은 use_finetuned=True이고 finetuned_model_id가 제공될 때만 사용
+	if use_finetuned and finetuned_model_id:
+		model = finetuned_model_id
+		logger.info(f"파인튜닝 모델 사용: {model}")
 	else:
-		model = model_env
+		model = "gpt-4o-mini"
+		logger.info(f"기본 모델 사용: {model}")
 	chunks = _chunk_paragraphs(text)
-	outputs: List[str] = []
-	for chunk in chunks:
+	
+	# 병렬 처리를 위한 헬퍼 함수
+	def _translate_chunk(chunk: str, chunk_idx: int, model_to_use: str) -> tuple[int, Optional[str]]:
 		prompt = (
 			f"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요.\n\n"
 			f"번역 원칙:\n"
@@ -128,7 +120,7 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 		)
 		try:
 			resp = client.chat.completions.create(
-				model=model,
+				model=model_to_use,
 				messages=[
 					{
 						"role": "system", 
@@ -147,7 +139,7 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 				temperature=0.35,  # 자연스럽고 매끄러운 표현을 위해 약간의 다양성 허용
 			)
 			content = resp.choices[0].message.content if resp.choices else ""
-			outputs.append(content or "")
+			return (chunk_idx, content or "")
 		except Exception as exc:
 			error_msg = str(exc).lower()
 			error_type = type(exc).__name__
@@ -164,9 +156,9 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 			
 			# 모델이 존재하지 않는 경우 기본 모델로 재시도
 			if "model" in error_msg and ("not found" in error_msg or "invalid" in error_msg or "does not exist" in error_msg):
-				logger.warning(f"모델 '{model}'이 존재하지 않습니다. 기본 모델로 재시도합니다: {exc}")
+				logger.warning(f"모델 '{model_to_use}'이 존재하지 않습니다. 기본 모델로 재시도합니다: {exc}")
 				# 기본 모델로 재시도 (한 번만)
-				if model != "gpt-4o-mini":
+				if model_to_use != "gpt-4o-mini":
 					try:
 						resp = client.chat.completions.create(
 							model="gpt-4o-mini",
@@ -188,15 +180,44 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 							temperature=0.35,
 						)
 						content = resp.choices[0].message.content if resp.choices else ""
-						outputs.append(content or "")
+						return (chunk_idx, content or "")
 					except Exception as retry_exc:
 						logger.error("기본 모델로 재시도 실패: %s", retry_exc, exc_info=True)
-						return None
+						return (chunk_idx, None)
 				else:
-					return None
+					return (chunk_idx, None)
 			else:
 				logger.error("OpenAI translation chunk 실패: %s", exc, exc_info=True)
-				return None
+				return (chunk_idx, None)
+	
+	# 병렬 처리: 최대 5개의 청크를 동시에 번역
+	# OpenAI API rate limit을 고려하여 동시 요청 수를 제한
+	max_workers = min(5, len(chunks))
+	outputs: List[Optional[str]] = [None] * len(chunks)
+	
+	if len(chunks) == 1:
+		# 청크가 하나면 병렬 처리 불필요
+		_, result = _translate_chunk(chunks[0], 0, model)
+		if result is None:
+			return None
+		return result.strip()
+	
+	# 여러 청크를 병렬로 처리
+	with ThreadPoolExecutor(max_workers=max_workers) as executor:
+		future_to_chunk = {
+			executor.submit(_translate_chunk, chunk, idx, model): idx 
+			for idx, chunk in enumerate(chunks)
+		}
+		
+		for future in as_completed(future_to_chunk):
+			chunk_idx, result = future.result()
+			outputs[chunk_idx] = result
+	
+	# None이 있으면 실패한 청크가 있음
+	if any(x is None for x in outputs):
+		logger.error("일부 청크 번역 실패")
+		return None
+	
 	return "\n\n".join(outputs).strip()
 
 
@@ -218,12 +239,18 @@ def _translate_with_google_cloud(text: str, target_lang: str = "ko") -> Optional
 		return None
 
 
-def translate_text(text: str, target_lang: str = "ko") -> str:
+def translate_text(text: str, target_lang: str = "ko", use_finetuned: bool = False, finetuned_model_id: Optional[str] = None) -> str:
 	"""
 	Translate text using provider specified by TRANSLATION_PROVIDER.
 	Supported providers:
-	- openai (requires OPENAI_API_KEY, optional OPENAI_MODEL)
+	- openai (requires OPENAI_API_KEY, always uses gpt-4o-mini unless use_finetuned=True)
 	- google (Google Cloud Translate; requires GOOGLE_APPLICATION_CREDENTIALS)
+	
+	Args:
+		text: Text to translate
+		target_lang: Target language (default: "ko")
+		use_finetuned: If True, use finetuned model (requires finetuned_model_id)
+		finetuned_model_id: Finetuned model ID (e.g., "ft:gpt-3.5-turbo-0125:org:model:xxx")
 	"""
 	text = text or ""
 	if not text.strip():
@@ -232,7 +259,7 @@ def translate_text(text: str, target_lang: str = "ko") -> str:
 	provider = os.environ.get("TRANSLATION_PROVIDER", "openai").lower()
 
 	if provider == "openai":
-		translated = _translate_with_openai(text, target_lang=target_lang)
+		translated = _translate_with_openai(text, target_lang=target_lang, use_finetuned=use_finetuned, finetuned_model_id=finetuned_model_id)
 		if translated is not None and translated.strip():
 			return translated
 		fallback = _translate_with_google_cloud(text, target_lang=target_lang)

@@ -4,6 +4,7 @@ import { generatePdfFromText } from './pdf'
 import { PdfUploader } from './components/PdfUploader'
 import { TranslationResult } from './components/TranslationResult'
 import { DesignPreview, type DesignPreviewHandle } from './components/DesignPreview'
+import * as XLSX from 'xlsx'
 
 function App() {
   const [originalText, setOriginalText] = useState<string>('')
@@ -18,6 +19,7 @@ function App() {
   const [originalFileName, setOriginalFileName] = useState<string>('')
   const [previewMode, setPreviewMode] = useState<boolean>(false)
   const [uploadProgress, setUploadProgress] = useState<number>(0)
+  const [translationProgress, setTranslationProgress] = useState<number>(0)
   const [downloading, setDownloading] = useState<boolean>(false)
   const previewRef = useRef<DesignPreviewHandle | null>(null)
   const [finetuningStatus, setFinetuningStatus] = useState<FinetuningStatus | null>(null)
@@ -25,6 +27,7 @@ function App() {
   const [finetuningError, setFinetuningError] = useState<string>('')
   const [currentJobId, setCurrentJobId] = useState<string | null>(null)
   const [jobStatus, setJobStatus] = useState<any>(null)
+  const [finetunedModelId, setFinetunedModelId] = useState<string | null>(null)
 
   // 파인튜닝 상태 로드
   useEffect(() => {
@@ -65,13 +68,64 @@ function App() {
     setOriginalFileName(file.name)
     setPreviewMode(false)
     setUploadProgress(0)
+    setTranslationProgress(0)
+    
+    // 번역 진행률 시뮬레이션
+    let progressInterval: NodeJS.Timeout | null = null
+    
     try {
       if (file.type !== 'application/pdf') {
         throw new Error('PDF 파일만 업로드할 수 있습니다.')
       }
-      const result = await uploadAndTranslatePdf(file, (percent: number) => {
-        setUploadProgress(percent)
-      })
+      
+      // 업로드 완료 후 번역 진행률 추적
+      let translationStartTime: number | null = null
+      
+      const startTranslationProgress = () => {
+        translationStartTime = Date.now()
+        let progress = 0
+        
+        progressInterval = setInterval(() => {
+          if (translationStartTime) {
+            const elapsed = Date.now() - translationStartTime
+            // 매우 느린 진행률 증가 (실제 번역 속도에 맞춤)
+            // 초당 약 0.2-0.3% 증가 (즉, 300-500초에 95% 도달)
+            // 실제 번역이 오래 걸리므로 매우 보수적으로 계산
+            const baseProgress = Math.min(95, (elapsed / 300000) * 100) // 300초(5분)에 95% 도달
+            
+            // 추가로 매우 느린 증가 (초당 0.05% 정도)
+            progress = Math.min(95, baseProgress + (elapsed / 2000000) * 100)
+            
+            setTranslationProgress(Math.round(progress * 10) / 10) // 소수점 1자리까지
+          } else {
+            // 폴백: 매우 느린 증가
+            progress += 0.05
+            if (progress > 95) {
+              progress = 95
+            }
+            setTranslationProgress(Math.round(progress * 10) / 10)
+          }
+        }, 1000) // 1초마다 업데이트 (더 부드러운 표시)
+      }
+      
+      const result = await uploadAndTranslatePdf(
+        file, 
+        (percent: number) => {
+          setUploadProgress(percent)
+          // 업로드 완료 시 번역 진행률 시작
+          if (percent >= 100 && !progressInterval) {
+            startTranslationProgress()
+          }
+        },
+        false, // 기본적으로 파인튜닝 모델 사용 안 함
+        null
+      )
+      
+      // 번역 완료
+      if (progressInterval) {
+        clearInterval(progressInterval)
+      }
+      setTranslationProgress(100)
       setOriginalText(result.originalText)
       setTranslatedText(result.translatedText)
       setFileId(result.fileId)
@@ -81,40 +135,96 @@ function App() {
     } catch (e: any) {
       setError(e?.message ?? '업로드/번역 중 오류가 발생했습니다.')
     } finally {
+      if (progressInterval) {
+        clearInterval(progressInterval)
+      }
       setLoading(false)
       setUploadProgress(0)
+      setTranslationProgress(0)
     }
   }
 
-  const handleServerPdfDownload = async () => {
+  const handleExcelDownload = () => {
     const base = originalFileName?.replace(/\.[^/.]+$/, '') || 'document'
-    const out = `translated_${base}.pdf`
+    const out = `translated_${base}.xlsx`
     setError('')
     setDownloading(true)
     try {
-      console.log('[다운로드] 시작:', { fileId, translatedTextLength: translatedText.length })
-      if (fileId) {
-        console.log('[다운로드] 서버 PDF 다운로드 시도')
-        const blob = await downloadTranslatedPdf(fileId)
-        console.log('[다운로드] 서버 PDF 받음, 크기:', blob.size, 'bytes')
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = out
-        document.body.appendChild(a)
-        a.click()
-        document.body.removeChild(a)
-        URL.revokeObjectURL(url)
-        console.log('[다운로드] 완료')
-        return
+      console.log('[엑셀 다운로드] 시작:', { originalTextLength: originalText.length, translatedTextLength: translatedText.length, manualTranslationLength: manualTranslation.length })
+      
+      // layout 데이터가 있으면 블록 단위로 분리, 없으면 문단 단위로 분리
+      let data: Array<{ 원문: string; 번역문: string; '내가 직접 번역': string }> = []
+      
+      if (layout && layout.pages && layout.pages.length > 0) {
+        // layout의 blocks를 사용하여 블록 단위로 분리
+        const originalBlocks: string[] = []
+        const translatedBlocks: string[] = []
+        
+        // 모든 페이지의 블록을 순서대로 수집
+        for (const page of layout.pages) {
+          if (page.blocks) {
+            for (const block of page.blocks) {
+              const origText = (block.text || '').trim()
+              const transText = (block.translated_text || '').trim()
+              
+              if (origText || transText) {
+                originalBlocks.push(origText)
+                translatedBlocks.push(transText)
+              }
+            }
+          }
+        }
+        
+        // 내가 직접 번역을 블록 수에 맞춰 분리
+        const manualBlocks = manualTranslation.split(/\n\s*\n/).filter(p => p.trim())
+        
+        // 최대 블록 수 계산
+        const maxBlocks = Math.max(originalBlocks.length, translatedBlocks.length, manualBlocks.length)
+        
+        for (let i = 0; i < maxBlocks; i++) {
+          data.push({
+            원문: originalBlocks[i] || '',
+            번역문: translatedBlocks[i] || '',
+            '내가 직접 번역': manualBlocks[i] || ''
+          })
+        }
+      } else {
+        // layout이 없으면 문단 단위로 분리
+        const originalParagraphs = originalText.split(/\n\s*\n/).filter(p => p.trim())
+        const translatedParagraphs = translatedText.split(/\n\s*\n/).filter(p => p.trim())
+        const manualParagraphs = manualTranslation.split(/\n\s*\n/).filter(p => p.trim())
+        
+        const maxParagraphs = Math.max(originalParagraphs.length, translatedParagraphs.length, manualParagraphs.length)
+        
+        for (let i = 0; i < maxParagraphs; i++) {
+          data.push({
+            원문: (originalParagraphs[i] || '').trim(),
+            번역문: (translatedParagraphs[i] || '').trim(),
+            '내가 직접 번역': (manualParagraphs[i] || '').trim()
+          })
+        }
       }
-      // 안전망: 서버 fileId가 없다면 클라이언트에서 생성
-      console.log('[다운로드] 클라이언트 PDF 생성')
-      generatePdfFromText(translatedText, out)
-      console.log('[다운로드] 클라이언트 PDF 생성 완료')
+      
+      // 워크북 생성
+      const wb = XLSX.utils.book_new()
+      const ws = XLSX.utils.json_to_sheet(data)
+      
+      // 열 너비 설정
+      ws['!cols'] = [
+        { wch: 50 }, // A열: 원문
+        { wch: 50 }, // B열: 번역문
+        { wch: 50 }  // C열: 내가 직접 번역
+      ]
+      
+      XLSX.utils.book_append_sheet(wb, ws, '번역 결과')
+      
+      // 파일 다운로드
+      XLSX.writeFile(wb, out)
+      
+      console.log('[엑셀 다운로드] 완료, 총', data.length, '행')
     } catch (e: any) {
-      console.error('[다운로드] 오류:', e)
-      setError(e?.message ?? '다운로드 중 오류가 발생했습니다.')
+      console.error('[엑셀 다운로드] 오류:', e)
+      setError(e?.message ?? '엑셀 다운로드 중 오류가 발생했습니다.')
     } finally {
       setDownloading(false)
     }
@@ -170,9 +280,11 @@ function App() {
           >
             <div style={{ fontSize: 18, fontWeight: 600, color: '#111' }}>
               {uploadProgress > 0 && uploadProgress < 100
-                ? `업로드 중... ${uploadProgress}%`
-                : uploadProgress >= 100
-                ? '업로드 완료! 번역을 처리하고 있습니다...'
+                ? `업로드 중... ${Math.round(uploadProgress)}%`
+                : uploadProgress >= 100 && translationProgress < 100
+                ? `번역 중... ${Math.round(translationProgress)}%`
+                : translationProgress >= 100
+                ? '번역 완료!'
                 : '준비 중입니다...'}
             </div>
             <div
@@ -185,9 +297,9 @@ function App() {
             >
               <div
                 style={{
-                  width: `${Math.min(uploadProgress, 100)}%`,
+                  width: `${uploadProgress < 100 ? Math.min(uploadProgress, 100) : Math.min(translationProgress, 100)}%`,
                   height: '100%',
-                  transition: 'width 0.2s ease',
+                  transition: 'width 0.3s ease',
                   background: 'linear-gradient(90deg, #138577, #0f766e)',
                 }}
               />
@@ -195,7 +307,9 @@ function App() {
             <div style={{ fontSize: 14, color: '#555' }}>
               {uploadProgress < 100
                 ? 'PDF를 서버로 업로드하는 중입니다.'
-                : '번역 모델이 텍스트를 변환하는 중입니다.'}
+                : translationProgress < 100
+                ? '번역 모델이 텍스트를 변환하는 중입니다.'
+                : '처리 완료!'}
             </div>
           </div>
         </div>
@@ -299,11 +413,9 @@ function App() {
                     setJobStatus(status)
                     
                     if (status.status === 'succeeded' && status.fine_tuned_model) {
-                      if (status.env_updated) {
-                        alert(`🎉 학습 완료!\n\n${status.message}\n\n컨테이너를 재시작하면 새 모델이 적용됩니다:\ndocker-compose restart backend`)
-                      } else {
-                        alert(`🎉 학습 완료!\n\n모델 ID: ${status.fine_tuned_model}\n\n.env 파일에 다음을 추가하세요:\nOPENAI_MODEL=${status.fine_tuned_model}`)
-                      }
+                      // 파인튜닝 모델 ID 저장 (번역 시 선택적으로 사용)
+                      setFinetunedModelId(status.fine_tuned_model)
+                      alert(`🎉 학습 완료!\n\n모델 ID: ${status.fine_tuned_model}\n\n이 모델은 번역 시 선택적으로 사용할 수 있습니다.\n일반 번역은 항상 gpt-4o-mini를 사용합니다.`)
                       setCurrentJobId(null) // 완료되면 상태 확인 중지
                     } else if (status.status === 'failed') {
                       alert(`❌ 학습 실패: ${status.error || '알 수 없는 오류'}`)
@@ -411,7 +523,7 @@ function App() {
       <TranslationResult 
         originalText={originalText} 
         translatedText={translatedText} 
-        onDownload={handleServerPdfDownload} 
+        onDownload={handleExcelDownload} 
         canDownload={!!translatedText && !downloading} 
         userTranslation={manualTranslation}
         onUserTranslationChange={setManualTranslation}
@@ -419,7 +531,7 @@ function App() {
       />
       {downloading && (
         <div style={{ marginTop: 8, padding: 12, backgroundColor: '#f0f0f0', borderRadius: 4 }}>
-          PDF 다운로드 중... (큰 파일의 경우 시간이 걸릴 수 있습니다)
+          엑셀 다운로드 중...
         </div>
       )}
         </>
@@ -446,7 +558,7 @@ function App() {
               onClick={handlePreviewDownload} 
               disabled={!layout || !layout?.pages?.length}
               style={{
-                backgroundColor: (!layout || !layout?.pages?.length) ? '#9ca3af' : '#14b8a6',
+                backgroundColor: (!layout || !layout?.pages?.length) ? '#9ca3af' : '#138577',
                 color: '#ffffff',
                 border: 'none',
                 padding: '0.6rem 1rem',
@@ -462,7 +574,7 @@ function App() {
               onClick={handlePreviewWordDownload} 
               disabled={!layout || !layout?.pages?.length}
               style={{
-                backgroundColor: (!layout || !layout?.pages?.length) ? '#9ca3af' : '#14b8a6',
+                backgroundColor: (!layout || !layout?.pages?.length) ? '#9ca3af' : '#138577',
                 color: '#ffffff',
                 border: 'none',
                 padding: '0.6rem 1rem',
