@@ -90,7 +90,25 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 	client = _get_openai_client()
 	if client is None:
 		return None
-	model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+	# 기본값을 고품질 GPT-4 계열 모델로 설정 (환경 변수로 언제든지 override 가능)
+	# 예) OPENAI_MODEL=gpt-4.1 또는 OPENAI_MODEL=gpt-4o
+	# Fine-tuned 모델 ID가 유효한지 확인 (ft:로 시작하는 경우)
+	model_env = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+	
+	# Fine-tuned 모델 ID가 예시 값이거나 유효하지 않으면 기본 모델 사용
+	# 예시 값: abc123, example, test 등이 포함된 경우
+	invalid_patterns = ["abc123", "example", "test", "your-org", "your-model"]
+	is_invalid_finetuned = (
+		model_env.startswith("ft:") and 
+		any(pattern in model_env.lower() for pattern in invalid_patterns)
+	)
+	
+	if is_invalid_finetuned:
+		# 예시 모델 ID이므로 기본 모델 사용
+		logger.warning(f"Fine-tuned 모델 ID가 예시 값입니다. 기본 모델을 사용합니다: {model_env}")
+		model = "gpt-4o-mini"
+	else:
+		model = model_env
 	chunks = _chunk_paragraphs(text)
 	outputs: List[str] = []
 	for chunk in chunks:
@@ -104,7 +122,8 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 			f"5. 【구조 유지】 문단 구분, 줄바꿈, 리스트 구조는 원본과 동일하게 유지\n"
 			f"6. 【완전성】 모든 내용을 빠짐없이 번역하되, 불필요한 내용 추가하지 않기\n"
 			f"7. 【자연스러운 종결】 제목은 체언형(명사형), 본문은 '~합니다/됩니다/있습니다' 등 문맥에 맞는 자연스러운 종결어미 사용\n"
-			f"8. 【기술 문서】 전문성을 유지하되 딱딱하지 않고 읽기 편한 설명투로 작성\n\n"
+			f"8. 【브로셔 톤】 병원/의료 서비스 브로셔나 소개 자료에 쓸 수 있을 정도로 자연스럽고 매끄러운 문체로 번역하되, 지나치게 가볍지 않게 품위 있게 작성\n"
+			f"9. 【문단 단위 번역】 한 문장씩 기계적으로 번역하지 말고, 문단 전체를 하나의 덩어리로 보고 문맥을 고려해 자연스럽게 다시 쓰기\n\n"
 			f"번역할 텍스트:\n{chunk}"
 		)
 		try:
@@ -114,25 +133,70 @@ def _translate_with_openai(text: str, target_lang: str = "ko") -> Optional[str]:
 					{
 						"role": "system", 
 						"content": (
-							"당신은 10년 경력의 전문 기술 번역가입니다. "
-							"영어를 자연스러운 한국어로 의역하는 것이 핵심입니다. "
+							"당신은 10년 경력의 전문 번역가이자 브로셔/홍보 카피라이팅에 능숙한 전문가입니다. "
+							"영어를 자연스럽고 매끄러운 한국어로 의역하는 것이 핵심입니다. "
 							"직역은 절대 금지되며, 한국 독자가 읽기 편한 자연스러운 표현을 사용합니다. "
-							"기술 용어는 필요시 부연 설명을 추가하여 이해하기 쉽게 만듭니다. "
-							"문장 구조는 한국어 어순에 맞게 재배치하고, 어색한 표현은 자연스럽게 다듬습니다. "
-							"전문성을 유지하되 딱딱하지 않은 설명투로 작성하여 독자가 편안하게 읽을 수 있도록 합니다. "
-							"모든 내용을 완전히 번역하되, 원본에 없는 내용은 추가하지 않습니다."
+							"기술/의료 용어는 필요시 짧은 부연 설명을 덧붙여 이해하기 쉽게 만듭니다. "
+							"문단 전체의 흐름과 맥락을 먼저 파악한 뒤, 문장 구조를 한국어 어순에 맞게 재배치하고 자연스럽게 다듬습니다. "
+							"병원·의료 서비스 브로셔에 실릴 수 있을 정도로 세련되고 품위 있는 문체를 유지하되, 과장되거나 가벼운 표현은 피합니다. "
+							"모든 내용을 완전히 번역하되, 원본에 없는 정보를 새로 추가하거나 왜곡하지 않습니다."
 						)
 					},
 					{"role": "user", "content": prompt},
 				],
-				temperature=0.3,  # 자연스러운 표현을 위해 약간 높임
+				temperature=0.35,  # 자연스럽고 매끄러운 표현을 위해 약간의 다양성 허용
 			)
 			content = resp.choices[0].message.content if resp.choices else ""
 			outputs.append(content or "")
 		except Exception as exc:
-			logger.error("OpenAI translation chunk 실패: %s", exc, exc_info=True)
-			# If one chunk fails, bail out to fallback method
-			return None
+			error_msg = str(exc).lower()
+			error_type = type(exc).__name__
+			
+			# 할당량 초과 오류 명확히 표시
+			if "ratelimit" in error_msg or "429" in error_msg or "quota" in error_msg or error_type == "RateLimitError":
+				logger.error("OpenAI API 할당량 초과: %s", exc)
+				raise RuntimeError(
+					"OpenAI API 할당량이 초과되었습니다. "
+					"OpenAI 계정의 사용량 및 결제 정보를 확인하거나, "
+					"잠시 후 다시 시도하세요. "
+					"또는 `TRANSLATION_PROVIDER`를 `google`로 변경하여 Google Cloud Translate를 사용할 수 있습니다."
+				) from exc
+			
+			# 모델이 존재하지 않는 경우 기본 모델로 재시도
+			if "model" in error_msg and ("not found" in error_msg or "invalid" in error_msg or "does not exist" in error_msg):
+				logger.warning(f"모델 '{model}'이 존재하지 않습니다. 기본 모델로 재시도합니다: {exc}")
+				# 기본 모델로 재시도 (한 번만)
+				if model != "gpt-4o-mini":
+					try:
+						resp = client.chat.completions.create(
+							model="gpt-4o-mini",
+							messages=[
+								{
+									"role": "system", 
+									"content": (
+										"당신은 10년 경력의 전문 번역가이자 브로셔/홍보 카피라이팅에 능숙한 전문가입니다. "
+										"영어를 자연스럽고 매끄러운 한국어로 의역하는 것이 핵심입니다. "
+										"직역은 절대 금지되며, 한국 독자가 읽기 편한 자연스러운 표현을 사용합니다. "
+										"기술/의료 용어는 필요시 짧은 부연 설명을 덧붙여 이해하기 쉽게 만듭니다. "
+										"문단 전체의 흐름과 맥락을 먼저 파악한 뒤, 문장 구조를 한국어 어순에 맞게 재배치하고 자연스럽게 다듬습니다. "
+										"병원·의료 서비스 브로셔에 실릴 수 있을 정도로 세련되고 품위 있는 문체를 유지하되, 과장되거나 가벼운 표현은 피합니다. "
+										"모든 내용을 완전히 번역하되, 원본에 없는 정보를 새로 추가하거나 왜곡하지 않습니다."
+									)
+								},
+								{"role": "user", "content": prompt},
+							],
+							temperature=0.35,
+						)
+						content = resp.choices[0].message.content if resp.choices else ""
+						outputs.append(content or "")
+					except Exception as retry_exc:
+						logger.error("기본 모델로 재시도 실패: %s", retry_exc, exc_info=True)
+						return None
+				else:
+					return None
+			else:
+				logger.error("OpenAI translation chunk 실패: %s", exc, exc_info=True)
+				return None
 	return "\n\n".join(outputs).strip()
 
 

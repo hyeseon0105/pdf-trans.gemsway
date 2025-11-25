@@ -18,9 +18,7 @@ body {
 .container {
   max-width: 100%;
   margin: 0;
-  padding: 2rem 0 4rem 0 !important;
-  padding-left: 0 !important;
-  padding-right: 0 !important;
+  padding: 0 2rem 4rem 2rem !important;
   text-align: left;
 }
 
@@ -95,6 +93,11 @@ h1 {
 
 .error {
   color: var(--error);
+}
+
+/* 로고 이미지가 로드되면 텍스트 로고 숨김 */
+header img[src="/logo.png"]:not([style*="display: none"]) + .logo-text-fallback {
+  display: none !important;
 }
 
 

@@ -247,8 +247,16 @@ async def translate_pdf(file: UploadFile = File(...)):
 							translated_block = translated_block.strip()
 						
 						if not translated_block or not translated_block.strip():
-							print(f"Warning: Translation still empty, using original text")
-							translated_block = original_text
+							print(f"Warning: Translation still empty, will retry translation")
+							# 원본 텍스트를 사용하지 않고 다시 번역 시도
+							try:
+								translated_block = translate_text(original_text, target_lang="ko")
+								if not translated_block or not translated_block.strip():
+									print(f"Error: Translation failed completely for block")
+									continue  # 이 블록은 건너뜀
+							except Exception as retry_e:
+								print(f"Error: Retry translation failed: {retry_e}")
+								continue  # 이 블록은 건너뜀
 						
 						# Store translation (but don't use as cache for future blocks)
 						block["translated_text"] = translated_block
@@ -269,9 +277,11 @@ async def translate_pdf(file: UploadFile = File(...)):
 							translated_block = re.sub(r'^(Text to translate|번역할 텍스트):?\s*', '', translated_block, flags=re.IGNORECASE)
 							translated_block = translated_block.strip()
 							if not translated_block or not translated_block.strip():
-								translated_block = original_text
-						except:
-							translated_block = original_text
+								print(f"Error: Translation failed for block, skipping")
+								continue  # 이 블록은 건너뜀
+						except Exception as retry_e2:
+							print(f"Error: Final retry translation failed: {retry_e2}")
+							continue  # 이 블록은 건너뜀
 						
 						block["translated_text"] = translated_block
 						translated_blocks_text.append(translated_block)

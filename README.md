@@ -2,9 +2,25 @@
 
 영어 PDF를 업로드하면 한국어로 번역하고, 번역된 내용을 다시 PDF로 다운로드할 수 있는 예제입니다.
 
+### 🚀 빠른 시작 (5분)
+
+**Docker가 설치되어 있다면:**
+```bash
+# 1. .env 파일 생성 (OpenAI API 키 설정)
+echo "OPENAI_API_KEY=sk-proj-your-key" > .env
+
+# 2. 실행
+docker-compose up -d
+
+# 완료! http://localhost:5173 접속
+```
+
+**더 자세한 배포 가이드**: [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md)
+
 ### 구성
 - `frontend`: React + Vite + TypeScript
 - `backend`: FastAPI, PDF 추출/번역/생성
+- `mysql`: MySQL 8.0 (Docker Compose 포함)
 
 ### 필요 환경
 - Node.js 18+
@@ -113,5 +129,78 @@ GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp_sa.json
 ### 참고
 - 번역은 기본적으로 OpenAI를 사용하며, 설정에 따라 Google Cloud Translate로 전환할 수 있습니다. 키/권한 문제가 있을 경우 원문이 반환될 수 있습니다.
 - PDF 텍스트 추출은 `pypdf`를 사용하며, 스캔(pdf)·이미지 기반 PDF는 OCR이 없어 텍스트 추출이 어렵습니다.
+
+---
+
+## 🚀 OpenAI Fine-tuning (맞춤 번역 모델 학습)
+
+사용자가 직접 수정한 고품질 번역 데이터를 활용하여 프로젝트에 특화된 맞춤형 번역 모델을 학습할 수 있습니다.
+
+### 📚 상세 가이드
+
+전체 Fine-tuning 프로세스는 **[FINETUNING_GUIDE.md](./FINETUNING_GUIDE.md)** 를 참고하세요.
+
+### ⚡ 빠른 시작
+
+#### 1. JSONL 데이터 생성
+
+**Python 버전:**
+```bash
+cd backend/scripts
+python generate_jsonl_for_finetuning.py
+```
+
+**TypeScript 버전:**
+```bash
+npm install -g tsx
+tsx frontend/scripts/generate-jsonl-finetuning.ts
+```
+
+#### 2. Google Colab에서 Fine-tuning
+
+1. https://colab.research.google.com 접속
+2. `openai_finetuning_complete.ipynb` 업로드
+3. 노트북 셀 순서대로 실행
+4. Fine-tuned 모델 ID 복사
+
+#### 3. Backend에 적용
+
+`.env` 파일에 Fine-tuned 모델 ID 추가:
+
+```env
+OPENAI_API_KEY=sk-proj-your-api-key
+OPENAI_MODEL=ft:gpt-4o-mini-2024-07-18:org:cadwell-medical-ko:abc123
+```
+
+서버 재시작:
+
+```bash
+cd backend
+uvicorn app.main:app --reload --port 8000
+```
+
+### 📂 주요 파일
+
+- **JSONL 생성 스크립트**:
+  - `backend/scripts/generate_jsonl_for_finetuning.py` (Python)
+  - `frontend/scripts/generate-jsonl-finetuning.ts` (TypeScript/Node.js)
+  
+- **Google Colab 노트북**:
+  - `openai_finetuning_complete.ipynb`
+  
+- **가이드 문서**:
+  - `FINETUNING_GUIDE.md`
+
+### 💰 예상 비용
+
+- **학습**: 100개 예제, 3 epoch → 약 $0.02 (약 30원)
+- **사용**: 기본 gpt-4o-mini 모델과 동일한 가격
+
+### ✅ 장점
+
+- 🎯 **전문 용어 학습**: 의료기기 전문 번역 스타일 반영
+- 📈 **일관성 향상**: 동일한 표현에 대한 일관된 번역
+- 🚀 **품질 개선**: 사용자 수정 데이터를 통한 지속적 품질 향상
+- 💡 **맞춤형**: Cadwell Korea 브로셔에 최적화된 번역
 
 

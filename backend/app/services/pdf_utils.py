@@ -8,10 +8,10 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
 from reportlab.lib.units import mm
 
-from ..config import WINDOWS_MALGUN_TTF
+from ..config import WINDOWS_MALGUN_TTF, LOGO_PATH
 
 try:
 	import fitz  # PyMuPDF
@@ -93,6 +93,16 @@ def create_pdf_from_text(text: str, output_path: Path):
 	)
 
 	flow = []
+	
+	# 로고 이미지 추가 (파일이 존재하는 경우)
+	if LOGO_PATH.exists():
+		try:
+			logo = Image(str(LOGO_PATH), width=60 * mm, height=15 * mm)  # 적절한 크기로 조정
+			flow.append(logo)
+			flow.append(Spacer(1, 5 * mm))
+		except Exception as e:
+			print(f"로고 이미지 로드 실패: {e}")
+	
 	for block in text.split("\n\n"):
 		sanitized = block.replace("<", "&lt;").replace(">", "&gt;")
 		flow.append(Paragraph(sanitized, style=body_style))
@@ -243,46 +253,130 @@ def _detect_bullet_list(text: str) -> bool:
 
 def _segment_columns(blocks: list, page_width: float) -> list[list]:
 	"""
-	Segment blocks into columns using X-coordinate clustering.
-	Returns list of column blocks, sorted left to right.
+	X 좌표 기반으로 텍스트 블록을 컬럼 단위로 분리한다.
+	
+	주요 특징:
+	- 이미지 블록(`is_image=True`)은 컬럼 계산에서 제외
+	- X 중심 좌표 기반 1차 클러스터링 (가장 큰 gap 탐지)
+	- 위 기준으로 명확한 분리가 안 될 경우,
+	  페이지 구조를 보고 2컬럼 레이아웃으로 명시적으로 fallback
+	- 각 컬럼 내부는 Y(위→아래) 순으로 정렬
 	"""
 	if not blocks:
 		return []
 	
-	# Extract x-intervals for each block
-	intervals = []
-	for block in blocks:
-		x0, y0, x1, y1 = block["bbox"]
-		intervals.append((x0, x1, block))
-	
-	# Sort by x0
-	intervals.sort(key=lambda iv: iv[0])
-	
-	# Find column breaks using gap detection
-	# A gap larger than 10% of page width indicates column boundary
-	gap_threshold = page_width * 0.10
-	
-	columns = []
-	current_column = []
-	prev_x1 = None
-	
-	for x0, x1, block in intervals:
-		if prev_x1 is not None and (x0 - prev_x1) > gap_threshold:
-			# Start new column
-			if current_column:
-				columns.append(current_column)
-			current_column = [block]
-		else:
-			current_column.append(block)
+	# 1) 컬럼 계산에 사용할 대상만 추출 (이미지 블록 제외)
+	text_blocks: list = []
+	image_like_blocks: list = []
+	for b in blocks:
+		# 명시적인 이미지 플래그가 있는 경우 우선 제외
+		if b.get("is_image"):
+			image_like_blocks.append(b)
+			continue
 		
-		prev_x1 = max(prev_x1, x1) if prev_x1 is not None else x1
+		# 텍스트가 거의 없고, 박스가 지나치게 크면 이미지/배경 일 가능성이 높으므로
+		# 컬럼 계산에서는 제외하되, 최종 결과에는 그대로 포함된다.
+		x0, y0, x1, y1 = b["bbox"]
+		width = max(0.0, float(x1) - float(x0))
+		height = max(0.0, float(y1) - float(y0))
+		area = width * height
+		text_len = len((b.get("text") or "").strip())
+		if area > 0 and text_len <= 3 and width > page_width * 0.35 and height > 50:
+			image_like_blocks.append(b)
+		else:
+			text_blocks.append(b)
 	
-	if current_column:
-		columns.append(current_column)
+	# 컬럼 계산에 사용할 텍스트 블록이 없는 경우, 그대로 단일 컬럼 취급
+	if not text_blocks:
+		blocks_sorted = sorted(blocks, key=lambda bb: (bb["bbox"][0], bb["bbox"][1]))
+		return [blocks_sorted]
 	
-	# Sort each column by Y coordinate (top to bottom)
-	for col in columns:
-		col.sort(key=lambda b: b["bbox"][1])
+	# 2) X 중심 좌표 기반 정렬
+	candidates = []
+	for b in text_blocks:
+		x0, y0, x1, y1 = b["bbox"]
+		cx = (float(x0) + float(x1)) / 2.0
+		candidates.append((cx, b))
+	
+	candidates.sort(key=lambda item: item[0])
+	
+	# 3) 1차: 가장 큰 gap 기반 클러스터링 시도
+	centers = [cx for cx, _ in candidates]
+	if len(centers) == 1:
+		# 실질적으로 하나의 블록만 있는 경우
+		single_col = sorted(text_blocks, key=lambda bb: bb["bbox"][1])
+		return [single_col]
+	
+	gap_threshold = max(page_width * 0.04, 20.0)  # 페이지의 4% 또는 20pt 이상 차이만 의미 있는 gap으로 간주
+	max_gap = 0.0
+	max_gap_index = -1
+	for i in range(len(centers) - 1):
+		gap = centers[i + 1] - centers[i]
+		if gap > max_gap:
+			max_gap = gap
+			max_gap_index = i
+	
+	columns: list[list] = []
+	
+	if max_gap >= gap_threshold:
+		# gap 기준으로 좌/우 클러스터 나누기
+		left_blocks = [b for _, b in candidates[: max_gap_index + 1]]
+		right_blocks = [b for _, b in candidates[max_gap_index + 1 :]]
+		
+		if left_blocks:
+			left_blocks.sort(key=lambda bb: bb["bbox"][1])
+			columns.append(left_blocks)
+		if right_blocks:
+			right_blocks.sort(key=lambda bb: bb["bbox"][1])
+			columns.append(right_blocks)
+	else:
+		# 4) gap만으로는 분리가 안 되는 경우 → 2컬럼 레이아웃 fallback 판단
+		#    (실제 PDF 구조상 좌우에 고르게 블록이 분산되어 있으면 2컬럼으로 본다)
+		mid_x = page_width * 0.5
+		left_side = [b for b in text_blocks if ((b["bbox"][0] + b["bbox"][2]) / 2.0) < mid_x]
+		right_side = [b for b in text_blocks if ((b["bbox"][0] + b["bbox"][2]) / 2.0) >= mid_x]
+		
+		# 좌/우에 모두 충분한 개수(예: 2개 이상) 블록이 있으면 2컬럼으로 간주
+		if len(left_side) >= 2 and len(right_side) >= 2:
+			left_side.sort(key=lambda bb: bb["bbox"][1])
+			right_side.sort(key=lambda bb: bb["bbox"][1])
+			columns = [left_side, right_side]
+		else:
+			# 실질적으로는 단일 컬럼 레이아웃
+			one_col = sorted(text_blocks, key=lambda bb: bb["bbox"][1])
+			columns = [one_col]
+	
+	# 5) 컬럼 계산에서 제외했던 image_like_blocks 를 적절한 위치에 합치기
+	#    (단, 이들은 컬럼 분리에는 영향을 주지 않는다)
+	if image_like_blocks:
+		# 우선 전체 컬럼을 하나의 리스트로 평탄화해서 Y 순서로만 위치를 맞춘 뒤
+		# 다시 컬럼 구조로 나누는 것은 복잡하므로,
+		# 각 이미지 블록을 X 중심과 가장 가까운 컬럼에 단순 할당한다.
+		for img_block in image_like_blocks:
+			x0, y0, x1, y1 = img_block["bbox"]
+			cx = (float(x0) + float(x1)) / 2.0
+			
+			if not columns:
+				columns = [[img_block]]
+				continue
+			
+			closest_col_idx = 0
+			min_dist = float("inf")
+			for idx, col in enumerate(columns):
+				if not col:
+					continue
+				col_x0, _, col_x1, _ = col[0]["bbox"]
+				col_cx = (float(col_x0) + float(col_x1)) / 2.0
+				d = abs(cx - col_cx)
+				if d < min_dist:
+					min_dist = d
+					closest_col_idx = idx
+			
+			columns[closest_col_idx].append(img_block)
+		
+		# 이미지 블록 포함 후 다시 각 컬럼을 Y 기준 정렬
+		for col in columns:
+			col.sort(key=lambda bb: bb["bbox"][1])
 	
 	return columns
 
@@ -1103,28 +1197,94 @@ def render_high_quality_preview_images(
 						mask_y1 = min(h - 1, ry1 + padding)
 						cv2.rectangle(mask, (mask_x0, mask_y0), (mask_x1, mask_y1), color=255, thickness=-1)  # type: ignore
 						
-						# Store text block info for rendering
-						translated_text = b.get("translated_text") or ""
-						original_text = b.get("text", "")
+					# Store text block info for rendering
+					translated_text = b.get("translated_text") or ""
+					original_text = b.get("text", "")
+					
+					# Check if translated_text is actually English (needs retranslation)
+					def is_english_text(text: str) -> bool:
+							"""Check if text is primarily English (has little to no Korean)"""
+							if not text or not text.strip():
+								return False
+							import re
+							# Korean Unicode range: \uAC00-\uD7A3
+							korean_chars = len(re.findall(r'[\uAC00-\uD7A3]', text))
+							total_chars = len([c for c in text if c.isalnum() or c.isspace()])
+							if total_chars == 0:
+								return False
+							# If Korean ratio is less than 10%, consider it English
+							korean_ratio = korean_chars / total_chars if total_chars > 0 else 0
+							return korean_ratio < 0.1
+					
+					# Debug: Log translation status
+					if original_text.strip():
+						if not translated_text.strip():
+							print(f"Page {page_index + 1}: Block has no translated_text: '{original_text[:50]}...'")
+						elif is_english_text(translated_text):
+							print(f"Page {page_index + 1}: Block has English translated_text: '{translated_text[:50]}...' (original: '{original_text[:50]}...')")
+						else:
+							print(f"Page {page_index + 1}: Block has Korean translated_text: '{translated_text[:50]}...'")
+					
+					# If translated_text is missing, empty, or English, try to translate it
+						needs_translation = (
+							not translated_text.strip() or 
+							(translated_text.strip() and is_english_text(translated_text))
+						)
 						
-						# If translated_text is missing but original_text exists, try to translate it
-						if not translated_text.strip() and original_text.strip():
+						if needs_translation and original_text.strip():
 							# Fallback: translate the original text on the fly
 							try:
 								from ..services.translate_service import translate_text
-								print(f"Page {page_index + 1}: Missing translation for block, translating on-the-fly: '{original_text[:100]}...'")
-								translated_text = translate_text(original_text.strip(), target_lang="ko")
-								if translated_text.strip():
-									print(f"Page {page_index + 1}: Translated block on-the-fly: '{original_text[:50]}...' -> '{translated_text[:50]}...'")
+								if is_english_text(translated_text):
+									print(f"Page {page_index + 1}: translated_text is English, retranslating: '{original_text[:100]}...'")
 								else:
-									print(f"Page {page_index + 1}: Warning: Translation returned empty, using original text")
-									translated_text = original_text
+									print(f"Page {page_index + 1}: Missing translation for block, translating on-the-fly: '{original_text[:100]}...'")
+								
+								# 여러 번 재시도하여 번역 성공 확률 높이기
+								max_retries = 3
+								translation_success = False
+								for retry in range(max_retries):
+									try:
+										translated_text = translate_text(original_text.strip(), target_lang="ko")
+										if translated_text.strip() and not is_english_text(translated_text):
+											print(f"Page {page_index + 1}: Translated block on-the-fly (attempt {retry + 1}): '{original_text[:50]}...' -> '{translated_text[:50]}...'")
+											translation_success = True
+											break
+										else:
+											if retry < max_retries - 1:
+												print(f"Page {page_index + 1}: Translation attempt {retry + 1} returned empty or English, retrying...")
+									except Exception as retry_e:
+										if retry < max_retries - 1:
+											print(f"Page {page_index + 1}: Translation attempt {retry + 1} failed: {retry_e}, retrying...")
+										else:
+											raise retry_e
+								
+								if not translation_success:
+									print(f"Page {page_index + 1}: Warning: All translation attempts failed, will retry with full prompt")
+									# 최종 시도: 프롬프트를 포함한 전체 텍스트로 번역
+									try:
+										full_prompt = f"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요.\n\n{original_text.strip()}"
+										translated_text = translate_text(full_prompt, target_lang="ko")
+										# 프롬프트 부분 제거
+										if "번역해주세요" in translated_text:
+											parts = translated_text.split("번역해주세요")
+											if len(parts) > 1:
+												translated_text = parts[-1].strip()
+										if translated_text.strip() and not is_english_text(translated_text):
+											print(f"Page {page_index + 1}: Translated block with full prompt: '{original_text[:50]}...' -> '{translated_text[:50]}...'")
+											translation_success = True
+									except Exception as final_e:
+										print(f"Page {page_index + 1}: Final translation attempt failed: {final_e}")
+								
+								if not translation_success:
+									print(f"Page {page_index + 1}: Error: All translation attempts failed for block, will skip rendering")
+									translated_text = ""  # Don't use original text, skip instead
 							except Exception as e:
 								print(f"Page {page_index + 1}: Failed to translate block on-the-fly: {e}")
 								import traceback
 								traceback.print_exc()
-								# Use original text as fallback (better than skipping)
-								translated_text = original_text
+								# Don't use original text, skip instead
+								translated_text = ""
 						
 						# Only skip if both original and translated are empty
 						if not translated_text.strip() and not original_text.strip():
@@ -1132,10 +1292,11 @@ def render_high_quality_preview_images(
 							print(f"Page {page_index + 1}: Skipping empty block at ({x0:.1f}, {y0:.1f}, {x1:.1f}, {y1:.1f})")
 							continue
 						
-						# If translated_text is still empty but original_text exists, use original as last resort
-						if not translated_text.strip() and original_text.strip():
-							print(f"Page {page_index + 1}: Warning: Using original text as fallback for block: '{original_text[:50]}...'")
-							translated_text = original_text
+						# If translated_text is still empty or English, skip the block (don't use original)
+						if not translated_text.strip() or is_english_text(translated_text):
+							print(f"Page {page_index + 1}: Warning: Skipping block with English or empty translation: '{original_text[:50]}...'")
+							empty_blocks_skipped += 1
+							continue
 						
 						# Get original text start position for alignment
 						original_text_start_x = b.get("text_start_x", x0)
@@ -1165,6 +1326,30 @@ def render_high_quality_preview_images(
 			img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # type: ignore
 			pil_img = Image.fromarray(img_rgb)
 			draw = ImageDraw.Draw(pil_img)
+			
+			# 로고 이미지 추가 (텍스트 위에 배치)
+			if LOGO_PATH.exists():
+				try:
+					logo_img = Image.open(str(LOGO_PATH))
+					# 로고 크기 조정 (페이지 너비의 15% 정도)
+					logo_width = int(w * 0.15)
+					logo_height = int(logo_img.height * (logo_width / logo_img.width))
+					logo_img = logo_img.resize((logo_width, logo_height), Image.Resampling.LANCZOS)
+					
+					# 로고 위치: 페이지 상단 중앙 또는 왼쪽 상단
+					logo_x = int(w * 0.05)  # 왼쪽에서 5% 위치
+					logo_y = int(h * 0.02)  # 상단에서 2% 위치
+					
+					# 로고가 투명도(alpha)를 가지고 있으면 paste with alpha, 아니면 일반 paste
+					if logo_img.mode == 'RGBA':
+						# 투명 배경에 로고 오버레이
+						pil_img.paste(logo_img, (logo_x, logo_y), logo_img)
+					else:
+						pil_img.paste(logo_img, (logo_x, logo_y))
+					
+					print(f"Page {page_index + 1}: 로고 추가됨 (위치: {logo_x}, {logo_y}, 크기: {logo_width}x{logo_height})")
+				except Exception as e:
+					print(f"Page {page_index + 1}: 로고 이미지 로드 실패: {e}")
 			
 			# Load Korean font
 			korean_font_path = None

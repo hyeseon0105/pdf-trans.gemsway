@@ -1,23 +1,62 @@
+version: '3.8'
+
 services:
   backend:
     build:
       context: ./backend
-    container_name: pdf-translator-backend
-    env_file:
-      - ./.env
+    container_name: cadwell_api
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       - FRONTEND_ORIGIN=http://localhost:5173
       - WINDOWS_MALGUN_TTF=/usr/share/fonts/truetype/nanum/NanumGothic.ttf
       - TRANSLATION_PROVIDER=${TRANSLATION_PROVIDER:-openai}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Fine-tuned 모델 ID (.env 파일에서 설정, 없으면 기본 모델 사용)
+      # 주의: 파인튜닝 모델은 비용이 더 많이 듭니다. 기본값은 gpt-4o-mini (저렴함)
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      # 최소 학습 데이터 개수 (기본값: 30, 테스트용으로 낮출 수 있음)
+      - MIN_TRAINING_COUNT=${MIN_TRAINING_COUNT:-30}
       - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+      # MySQL 연결 설정
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER:-root}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-cadwell_translate}
+    depends_on:
+      mysql:
+        condition: service_healthy
     volumes:
       - backend_storage:/app/app/storage
+      # .env 파일만 마운트하여 자동 업데이트 가능 (쓰기 가능)
+      # 주의: .env 파일이 존재해야 합니다. 없으면 먼저 생성하세요.
+      - ./.env:/workspace/.env:rw
     networks:
       - pdf-net
+
+  mysql:
+    image: mysql:8.0
+    container_name: cadwell_mysql
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD:-}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-cadwell_translate}
+    ports:
+      - "3307:3306"  # 로컬 MySQL이 3306 사용 중이므로 3307로 변경
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backend/database/schema_mysql.sql:/docker-entrypoint-initdb.d/schema_mysql.sql:ro
+    networks:
+      - pdf-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_PASSWORD:-}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   frontend:
     build:
@@ -38,5 +77,6 @@ networks:
 
 volumes:
   backend_storage:
+  mysql_data:
 
 
